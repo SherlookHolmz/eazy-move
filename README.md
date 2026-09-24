@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/32607625/README.md)
 # PasarGuard Manager
 
 ابزار ساده برای **بکاپ، ریستور و انتقال PasarGuard Panel + PG-Node** از سرور قدیمی به سرور جدید.
@@ -7,97 +6,72 @@
 
 ## نصب آسان
 
-هیچ نیازی نیست Python، pip، Paramiko، Docker یا Docker Compose را دستی نصب کنید.
-
-روی سرور Ubuntu/Debian فقط اجرا کنید:
+فقط روی سرور **Ubuntu/Debian** این دستور را اجرا کنید:
 
 ```bash
-sudo bash install.sh
+curl -fsSL https://raw.githubusercontent.com/SherlookHolmz/eazy-move/main/install.sh | sudo bash
 ```
 
 Installer خودش:
 
-- پیش‌نیازهای سیستم را نصب می‌کند.
-- Docker را در صورت نبودن نصب می‌کند.
-- Docker Compose را در صورت نبودن نصب می‌کند.
-- محیط Python را می‌سازد.
-- وابستگی‌های Python را نصب می‌کند.
+- Python و پیش‌نیازها را نصب می‌کند.
+- Docker و Docker Compose را در صورت نیاز نصب می‌کند.
+- پروژه را از همین GitHub دریافت می‌کند.
+- محیط Python می‌سازد و وابستگی‌ها را نصب می‌کند.
 - برنامه را اجرا می‌کند.
 
-بعد از نصب:
+### نصب دستی
 
 ```bash
-sudo ./run.sh
+git clone https://github.com/SherlookHolmz/eazy-move.git
+cd eazy-move
+sudo bash install.sh
 ```
 
-## استفاده
-
-برنامه به‌صورت پیش‌فرض یک منوی ساده ترمینالی دارد و مراحل را خودش هدایت می‌کند:
+بعد از نصب، برای اجرای دوباره:
 
 ```bash
-sudo ./run.sh
+sudo /opt/eazy-move/run.sh
 ```
 
-امکانات اصلی:
+## امکانات
 
-- Backup کامل PasarGuard و PG-Node
-- Restore بکاپ
-- انتقال مستقیم از سرور قدیمی به سرور جدید با SSH/SFTP
-- تشخیص خودکار دیتابیس
-- بررسی سلامت و صحت Backup
-- بررسی SHA-256 فایل انتقالی
-- مدیریت NATS و Caddy در صورت شناسایی
-- مدیریت فایل‌های SSL خارجی
-- غیرفعال کردن Nodeهای منتقل‌شده برای جلوگیری از تداخل
+- Backup و Restore
+- انتقال مستقیم با SSH/SFTP
+- تشخیص دیتابیس
+- بررسی SHA-256 بکاپ
+- بررسی سلامت سرویس‌ها
+- پشتیبانی از NATS و Caddy در صورت شناسایی
+- مدیریت Certificateهای خارجی
+- جلوگیری از تداخل Nodeهای منتقل‌شده
 - ارسال Backup به Telegram
 
-## روند انتقال
-
-```text
-Old Server
-    ↓
-Backup
-    ↓
-SHA-256 Verification
-    ↓
-SSH/SFTP Transfer
-    ↓
-Restore
-    ↓
-Start Services
-    ↓
-Health Check
-```
-
-سرور قدیمی به‌صورت خودکار حذف یا خاموش نمی‌شود و فایل Backup نیز بعد از انتقال نگه داشته می‌شود.
-
-## اجرای دستورات مستقیم
+## دستورات
 
 ```bash
-sudo ./run.sh check
-sudo ./run.sh backup
-sudo ./run.sh restore ./backup.zip
-sudo ./run.sh migrate --host SERVER_IP
+sudo /opt/eazy-move/run.sh check
+sudo /opt/eazy-move/run.sh backup
+sudo /opt/eazy-move/run.sh restore ./backup.zip
+sudo /opt/eazy-move/run.sh migrate --host SERVER_IP
 ```
 
-## نکته امنیتی
+منوی داخل برنامه و تمام پیام‌های ترمینال **انگلیسی** هستند تا در SSH و ترمینال‌های مختلف مشکل RTL نداشته باشند.
 
-Backup ممکن است شامل `.env`، پسورد دیتابیس، API Key، اطلاعات Node و Private Key مربوط به SSL باشد.
+## هشدار امنیتی
 
-**هرگز فایل Backup را داخل GitHub قرار ندهید.**
+Backup ممکن است شامل `.env`، رمز دیتابیس، API Key، اطلاعات Node و Private Keyهای SSL باشد.
+
+**فایل Backup را داخل GitHub قرار ندهید.**
 
 ## ساختار پروژه
 
 ```text
-pasarguard_manager.py   هسته اصلی برنامه
 install.sh              Easy Installer
+run.sh                  اجرای برنامه
+pasarguard_manager.py   هسته اصلی برنامه
 requirements.txt        وابستگی‌های Python
-run.sh                  فایل اجرای برنامه
-README.md               مستندات
+README.md               راهنمای فارسی
+README.en.md            English README
 ```
 
-## سیستم‌های پشتیبانی‌شده
-
-در حال حاضر Easy Installer برای سرورهای **Ubuntu/Debian** طراحی شده است.
-
-نسخه انگلیسی مستندات: [README.en.md](README.en.md)
+[نسخه انگلیسی](README.en.md)
