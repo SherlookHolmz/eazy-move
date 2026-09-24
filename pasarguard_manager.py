@@ -401,6 +401,44 @@ def detect_db_family(compose_dir: Path) -> str:
     return "unknown"
 
 
+def capture_postgres_runtime(compose_dir: Path, service: str) -> dict[str, object]:
+    """Capture the exact PostgreSQL/TimescaleDB runtime used by the source backup."""
+    runtime: dict[str, object] = {"service": service}
+
+    code, out, err = shell_local(
+        f"docker compose ps -q {shlex.quote(service)}",
+        cwd=compose_dir,
+        timeout=30,
+    )
+    container_id = out.strip().splitlines()[0] if code == 0 and out.strip() else ""
+    if not container_id:
+        raise RuntimeError(err or "Could not find the running database container.")
+
+    code, out, err = shell_local(
+        f"docker inspect -f '{{{{.Config.Image}}}}|{{{{join .RepoDigests ","}}}}' {shlex.quote(container_id)}",
+        timeout=30,
+    )
+    if code != 0 or not out.strip():
+        raise RuntimeError(err or "Could not inspect the source database container.")
+    image, _, digests = out.strip().partition("|")
+    runtime["image"] = image
+    runtime["repo_digests"] = [x for x in digests.split(",") if x]
+
+    code, out, err = db_exec_local(
+        compose_dir,
+        service,
+        "psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres "
+        "-Atc "SELECT COALESCE((SELECT extversion FROM pg_extension WHERE extname='timescaledb'), "
+        "(SELECT default_version FROM pg_available_extensions WHERE name='timescaledb'), '');"",
+    )
+    if code != 0:
+        raise RuntimeError(err or out or "Could not detect the source TimescaleDB version.")
+    version = out.strip().splitlines()[0].strip() if out.strip() else ""
+    if version:
+        runtime["timescaledb_version"] = version
+    return runtime
+
+
 def is_special(path: Path) -> Optional[str]:
     try:
         mode = os.lstat(path).st_mode
@@ -925,20 +963,47 @@ def ensure_remote_postgres_runtime(
     client: paramiko.SSHClient,
     compose_dir: Path,
     service: str,
+    runtime: Optional[dict[str, object]] = None,
 ) -> None:
     """
     Make the target database container use the image declared by the restored
     compose file. This is important for TimescaleDB: a pre-existing container
     can otherwise keep an older image even after docker-compose.yml is restored.
     """
-    code, out, err = ssh_shell(
-        client,
-        f"cd {shlex.quote(str(compose_dir))} && "
-        f"docker compose pull --quiet {shlex.quote(service)}",
-        timeout=600,
-    )
-    if code != 0:
-        raise RuntimeError(err or out or "Could not pull the database image from the restored compose file")
+    runtime = runtime or {}
+    image = str(runtime.get("image") or "").strip()
+    digests = [str(x).strip() for x in (runtime.get("repo_digests") or []) if str(x).strip()]
+    expected_version = str(runtime.get("timescaledb_version") or "").strip()
+
+    # Prefer the exact source image digest. A mutable tag can point to a
+    # different TimescaleDB build on the target and cause "$libdir/timescaledb-X"
+    # restore failures.
+    if digests:
+        digest = digests[0]
+        code, out, err = ssh_shell(
+            client,
+            f"docker pull {shlex.quote(digest)}",
+            timeout=600,
+        )
+        if code != 0:
+            raise RuntimeError(err or out or f"Could not pull the source database image digest: {digest}")
+        if image:
+            code, out, err = ssh_shell(
+                client,
+                f"docker tag {shlex.quote(digest)} {shlex.quote(image)}",
+                timeout=60,
+            )
+            if code != 0:
+                raise RuntimeError(err or out or "Could not tag the exact source database image for Compose")
+    else:
+        code, out, err = ssh_shell(
+            client,
+            f"cd {shlex.quote(str(compose_dir))} && "
+            f"docker compose pull --quiet {shlex.quote(service)}",
+            timeout=600,
+        )
+        if code != 0:
+            raise RuntimeError(err or out or "Could not pull the database image from the restored compose file")
 
     code, out, err = ssh_shell(
         client,
@@ -963,13 +1028,20 @@ def ensure_remote_postgres_runtime(
     if code != 0:
         raise RuntimeError(err or out or "Could not inspect TimescaleDB availability")
 
-    if not out.strip():
+    available_version = out.strip().splitlines()[0].strip() if out.strip() else ""
+    if not available_version:
         raise RuntimeError(
             "The restored database image does not provide the TimescaleDB extension. "
             "The source backup requires TimescaleDB."
         )
+    if expected_version and available_version != expected_version:
+        raise RuntimeError(
+            "TimescaleDB version mismatch before restore: "
+            f"source requires {expected_version}, target provides {available_version}. "
+            "The database restore was stopped before importing SQL."
+        )
 
-    info(f"Remote TimescaleDB extension available: {out.strip()}")
+    info(f"Remote TimescaleDB extension available: {available_version}")
 
 
 def restore_database_remote(
@@ -979,12 +1051,13 @@ def restore_database_remote(
     family: str,
     cfg: dict,
     remote_dump: str,
+    runtime: Optional[dict[str, object]] = None,
 ) -> None:
     user = cfg.get("user") or "postgres"
     db = cfg.get("database") or "pasarguard"
 
     if family == "postgres":
-        ensure_remote_postgres_runtime(client, compose_dir, service)
+        ensure_remote_postgres_runtime(client, compose_dir, service, runtime)
         if user != "postgres":
             sql = (
                 "DO $$ BEGIN "
@@ -1312,6 +1385,7 @@ def backup_create(
             "user": cfg.get("user"),
             "database": cfg.get("database"),
         },
+        "database_runtime": {},
         "paths": {},
         "files": {},
         "nats": [],
@@ -1335,6 +1409,7 @@ def backup_create(
                 raise RuntimeError("Could not resolve PostgreSQL/TimescaleDB compose service.")
             if not wait_local_service(compose_dir, service, "postgres"):
                 raise RuntimeError("PostgreSQL/TimescaleDB is not ready.")
+            manifest["database_runtime"] = capture_postgres_runtime(compose_dir, service)
             dump_path = dump_dir / "pasarguard.sql"
             # Stream directly once; do not double-run the dump.
             user = cfg.get("user") or "postgres"
@@ -1993,7 +2068,15 @@ def restore_remote(
             raise RuntimeError("Remote database did not become ready")
 
         remote_dump = extract_dir / "database" / "pasarguard.sql"
-        restore_database_remote(client, PASARGUARD_DIR, service, family, cfg, str(remote_dump))
+        restore_database_remote(
+            client,
+            PASARGUARD_DIR,
+            service,
+            family,
+            cfg,
+            str(remote_dump),
+            manifest.get("database_runtime") or {},
+        )
 
     if disable_nodes:
         # Best effort on target. We intentionally do not fail migration if the
