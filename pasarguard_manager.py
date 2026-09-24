@@ -2535,29 +2535,37 @@ def interactive_menu() -> None:
         print("  5) 🤖 Telegram Backup Scheduler")
         print("  6) 🚪 Exit\n")
 
-        choice = input(f"{C.CYAN}Select [1-6]: {C.RESET}").strip()
+        try:
+            choice=input(f"{C.CYAN}Select [1-6]: {C.RESET}").strip()
+        except EOFError:
+            warn("Interactive input closed. Exiting.")
+            return
 
         try:
-            if choice == "1":
+            if choice=="1":
                 preflight_local()
-                input("\nPress ENTER...")
-            elif choice == "2":
-                db = input("Database [auto/postgres/mysql/sqlite]: ").strip().lower() or None
-                archive = backup_create(backup_dir=DEFAULT_BACKUP_DIR, db_family=db)
+                pause()
+            elif choice=="2":
+                db=input("Database [auto/postgres/mysql/sqlite]: ").strip().lower() or None
+                archive=backup_create(backup_dir=DEFAULT_BACKUP_DIR,db_family=db)
                 print(f"\nBackup: {archive}")
-                input("\nPress ENTER...")
-            elif choice == "3":
-                archive = Path(input("Backup ZIP path: ").strip())
-                restore_local(archive, force=False, disable_nodes=ask_yes_no("Disable restored nodes before panel startup?", True))
-                input("\nPress ENTER...")
-            elif choice == "4":
-                host = input("New server IP/hostname: ").strip()
-                port_text = input("SSH port [22]: ").strip() or "22"
-                username = input("SSH username [root]: ").strip() or "root"
-                use_key = input("SSH private key path (leave empty for password): ").strip()
-                password = None if use_key else getpass.getpass("SSH password: ")
-                archive_choice = input("Use existing backup ZIP path (leave empty to create a new one): ").strip()
-                archive = Path(archive_choice) if archive_choice else None
+                pause()
+            elif choice=="3":
+                archive=Path(input("Backup ZIP path: ").strip())
+                restore_local(
+                    archive,
+                    force=False,
+                    disable_nodes=ask_yes_no("Disable restored nodes before panel startup?",True),
+                )
+                pause()
+            elif choice=="4":
+                host=input("New server IP/hostname: ").strip()
+                port_text=input("SSH port [22]: ").strip() or "22"
+                username=input("SSH username [root]: ").strip() or "root"
+                use_key=input("SSH private key path (leave empty for password): ").strip()
+                password=None if use_key else getpass.getpass("SSH password: ")
+                archive_choice=input("Use existing backup ZIP path (leave empty to create a new one): ").strip()
+                archive=Path(archive_choice) if archive_choice else None
                 migrate(
                     archive=archive,
                     host=host,
@@ -2565,29 +2573,32 @@ def interactive_menu() -> None:
                     username=username,
                     password=password,
                     key_file=Path(use_key) if use_key else None,
-                    accept_new_host_key=ask_yes_no("Accept a new SSH host key?", False),
+                    accept_new_host_key=ask_yes_no("Accept a new SSH host key?",False),
                     force=False,
-                    disable_nodes=ask_yes_no("Disable restored nodes before panel startup?", True),
+                    disable_nodes=ask_yes_no("Disable restored nodes before panel startup?",True),
                 )
-                input("\nPress ENTER...")
-            elif choice == "5":
-                token = getpass.getpass("Telegram bot token: ")
-                chat_id = input("Telegram chat ID: ").strip()
-                hours = float(input("Interval hours [6]: ").strip() or "6")
-                schedule_telegram(hours, token, chat_id)
-            elif choice == "6":
+                pause()
+            elif choice=="5":
+                token=getpass.getpass("Telegram bot token: ")
+                chat_id=input("Telegram chat ID: ").strip()
+                hours=float(input("Interval hours [6]: ").strip() or "6")
+                schedule_telegram(hours,token,chat_id)
+            elif choice=="6":
                 print("Bye.")
                 return
             else:
                 warn("Invalid option.")
                 time.sleep(1)
+        except EOFError:
+            warn("Interactive input closed. Exiting.")
+            return
         except KeyboardInterrupt:
             print()
             warn("Operation cancelled.")
             time.sleep(1)
         except Exception as exc:
             error(str(exc))
-            input("\nPress ENTER...")
+            pause()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2639,6 +2650,9 @@ def main() -> int:
         return 1
 
     if not args.command:
+        if not ensure_interactive_stdin():
+            error("No interactive terminal is available. Use a CLI subcommand such as 'check', 'backup', 'restore', or 'migrate'.")
+            return 2
         interactive_menu()
         return 0
 
