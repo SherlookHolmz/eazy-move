@@ -51,7 +51,7 @@ except ImportError as exc:
 
 
 APP_NAME = "PasarGuard Manager"
-VERSION = "2.0.0"
+VERSION = "2.0.2"
 AUTHOR = "Sherlook"
 
 PASARGUARD_DIR = Path("/opt/pasarguard")
@@ -921,6 +921,57 @@ def restore_mysql_local(compose_dir: Path, service: str, cfg: dict, dump_path: P
             raise RuntimeError(err or out or "Could not recreate MySQL/MariaDB application user")
 
 
+def ensure_remote_postgres_runtime(
+    client: paramiko.SSHClient,
+    compose_dir: Path,
+    service: str,
+) -> None:
+    """
+    Make the target database container use the image declared by the restored
+    compose file. This is important for TimescaleDB: a pre-existing container
+    can otherwise keep an older image even after docker-compose.yml is restored.
+    """
+    code, out, err = ssh_shell(
+        client,
+        f"cd {shlex.quote(str(compose_dir))} && "
+        f"docker compose pull --quiet {shlex.quote(service)}",
+        timeout=600,
+    )
+    if code != 0:
+        raise RuntimeError(err or out or "Could not pull the database image from the restored compose file")
+
+    code, out, err = ssh_shell(
+        client,
+        f"cd {shlex.quote(str(compose_dir))} && "
+        f"docker compose up -d --force-recreate {shlex.quote(service)}",
+        timeout=300,
+    )
+    if code != 0:
+        raise RuntimeError(err or out or "Could not recreate the database container")
+
+    if not wait_remote_service(client, compose_dir, service, "postgres"):
+        raise RuntimeError("PostgreSQL/TimescaleDB did not become ready after image refresh")
+
+    code, out, err = db_exec_remote(
+        client,
+        compose_dir,
+        service,
+        "psql -v ON_ERROR_STOP=1 -U \"$POSTGRES_USER\" -d postgres "
+        "-Atc \"SELECT COALESCE(default_version, '') FROM pg_available_extensions "
+        "WHERE name='timescaledb';\"",
+    )
+    if code != 0:
+        raise RuntimeError(err or out or "Could not inspect TimescaleDB availability")
+
+    if not out.strip():
+        raise RuntimeError(
+            "The restored database image does not provide the TimescaleDB extension. "
+            "The source backup requires TimescaleDB."
+        )
+
+    info(f"Remote TimescaleDB extension available: {out.strip()}")
+
+
 def restore_database_remote(
     client: paramiko.SSHClient,
     compose_dir: Path,
@@ -933,6 +984,7 @@ def restore_database_remote(
     db = cfg.get("database") or "pasarguard"
 
     if family == "postgres":
+        ensure_remote_postgres_runtime(client, compose_dir, service)
         if user != "postgres":
             sql = (
                 "DO $$ BEGIN "
