@@ -414,23 +414,40 @@ def capture_postgres_runtime(compose_dir: Path, service: str) -> dict[str, objec
     if not container_id:
         raise RuntimeError(err or "Could not find the running database container.")
 
+    # RepoDigests belongs to the IMAGE inspect object, not the CONTAINER
+    # inspect object. Older versions of this code queried it from
+    # \`docker inspect <container>\`, which fails with:
+    # template: :1:25: executing "" at <.RepoDigests>: map has no entry for key "RepoDigests"
+    # Get the configured image from the container first, then inspect that image.
     inspect_cmd = (
-        "docker inspect -f '{{.Config.Image}}|{{join .RepoDigests \",\"}}' "
+        "docker inspect -f '{{.Config.Image}}' "
         f"{shlex.quote(container_id)}"
     )
-    code, out, err = shell_local(inspect_cmd, timeout=30)
-    if code != 0 or not out.strip():
-        raise RuntimeError(err or "Could not inspect the source database container.")
-    image, _, digests = out.strip().partition("|")
+    code, image, err = shell_local(inspect_cmd, timeout=30)
+    image = image.strip()
+    if code != 0 or not image:
+        raise RuntimeError(err or "Could not determine the source database image.")
     runtime["image"] = image
-    runtime["repo_digests"] = [x for x in digests.split(",") if x]
 
+    digest_cmd = (
+        "docker image inspect -f '{{join .RepoDigests \",\"}}' "
+        f"{shlex.quote(image)}"
+    )
+    code, digests, err = shell_local(digest_cmd, timeout=30)
+    if code == 0 and digests.strip():
+        runtime["repo_digests"] = [x for x in digests.strip().split(",") if x]
+    else:
+        # A local/private/dangling image may have no RepoDigests. This is not
+        # fatal because Compose can still restore the image from its tag.
+        runtime["repo_digests"] = []
+
+    # Only require TimescaleDB when it is actually installed in the
+    # source database. PostgreSQL itself is a supported PasarGuard backend.
     code, out, err = db_exec_local(
         compose_dir,
         service,
         'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres '
-        "-Atc \"SELECT COALESCE((SELECT extversion FROM pg_extension WHERE extname='timescaledb'), "
-        "(SELECT default_version FROM pg_available_extensions WHERE name='timescaledb'), '');\"",
+        "-Atc \"SELECT COALESCE((SELECT extversion FROM pg_extension WHERE extname='timescaledb'), '');\"",
     )
     if code != 0:
         raise RuntimeError(err or out or "Could not detect the source TimescaleDB version.")
@@ -1018,31 +1035,34 @@ def ensure_remote_postgres_runtime(
     if not wait_remote_service(client, compose_dir, service, "postgres"):
         raise RuntimeError("PostgreSQL/TimescaleDB did not become ready after image refresh")
 
-    code, out, err = db_exec_remote(
-        client,
-        compose_dir,
-        service,
-        "psql -v ON_ERROR_STOP=1 -U \"$POSTGRES_USER\" -d postgres "
-        "-Atc \"SELECT COALESCE(default_version, '') FROM pg_available_extensions "
-        "WHERE name='timescaledb';\"",
-    )
-    if code != 0:
-        raise RuntimeError(err or out or "Could not inspect TimescaleDB availability")
-
-    available_version = out.strip().splitlines()[0].strip() if out.strip() else ""
-    if not available_version:
-        raise RuntimeError(
-            "The restored database image does not provide the TimescaleDB extension. "
-            "The source backup requires TimescaleDB."
+    if expected_version:
+        code, out, err = db_exec_remote(
+            client,
+            compose_dir,
+            service,
+            "psql -v ON_ERROR_STOP=1 -U \"$POSTGRES_USER\" -d postgres "
+            "-Atc \"SELECT COALESCE(default_version, '') FROM pg_available_extensions "
+            "WHERE name='timescaledb';\"",
         )
-    if expected_version and available_version != expected_version:
-        raise RuntimeError(
-            "TimescaleDB version mismatch before restore: "
-            f"source requires {expected_version}, target provides {available_version}. "
-            "The database restore was stopped before importing SQL."
-        )
+        if code != 0:
+            raise RuntimeError(err or out or "Could not inspect TimescaleDB availability")
 
-    info(f"Remote TimescaleDB extension available: {available_version}")
+        available_version = out.strip().splitlines()[0].strip() if out.strip() else ""
+        if not available_version:
+            raise RuntimeError(
+                "The restored database image does not provide the TimescaleDB extension. "
+                "The source backup requires TimescaleDB."
+            )
+        if available_version != expected_version:
+            raise RuntimeError(
+                "TimescaleDB version mismatch before restore: "
+                f"source requires {expected_version}, target provides {available_version}. "
+                "The database restore was stopped before importing SQL."
+            )
+
+        info(f"Remote TimescaleDB extension available: {available_version}")
+    else:
+        info("Source database does not use TimescaleDB; no TimescaleDB image check required.")
 
 
 def restore_database_remote(
