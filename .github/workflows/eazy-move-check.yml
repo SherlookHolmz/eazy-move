@@ -1,0 +1,29 @@
+name: eazy-move-check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip paramiko
+      - name: Compile manager
+        run: python -m py_compile pasarguard_manager.py
+      - name: Check database URL parsing
+        run: |
+          python - <<'PY'
+          from pasarguard_manager import parse_database_url
+
+          assert parse_database_url("sqlite+aiosqlite:///db.sqlite3")["database"] == "db.sqlite3"
+          assert parse_database_url("sqlite+aiosqlite:////var/lib/pasarguard/db.sqlite3")["database"] == "/var/lib/pasarguard/db.sqlite3"
+          assert parse_database_url("postgresql+asyncpg://user:pass@db:5432/pasarguard")["family"] == "postgres"
+          assert parse_database_url("mysql+asyncmy://user:pass@db:3306/pasarguard")["family"] == "mysql"
+          print("database URL checks: OK")
+          PY
