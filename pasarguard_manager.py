@@ -51,7 +51,7 @@ except ImportError as exc:
 
 
 APP_NAME = "PasarGuard Manager"
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 AUTHOR = "Sherlook"
 
 PASARGUARD_DIR = Path("/opt/pasarguard")
@@ -63,8 +63,11 @@ DEFAULT_BACKUP_DIR = Path.cwd()
 DEFAULT_REMOTE_DIR = Path("/tmp/pasarguard-manager")
 
 COMPOSE_DOWN_TIMEOUT = 30
+COMPOSE_UP_TIMEOUT = 600
+REMOTE_COMPOSE_UP_TIMEOUT = 900
 SERVICE_READY_TIMEOUT = 180
 STACK_READY_TIMEOUT = 180
+REMOTE_BOOTSTRAP_TIMEOUT = 600
 DATABASE_RESTORE_TIMEOUT = 3600
 SSH_TIMEOUT = 30
 SSH_BANNER_TIMEOUT = 30
@@ -131,10 +134,36 @@ def header(title: str) -> None:
 
 def ask_yes_no(prompt: str, default: bool = False) -> bool:
     suffix = "Y/n" if default else "y/N"
-    value = input(f"{C.CYAN}{prompt} [{suffix}]: {C.RESET}").strip().lower()
+    try:
+        value = input(f"{C.CYAN}{prompt} [{suffix}]: {C.RESET}").strip().lower()
+    except EOFError:
+        warn("No interactive input is available. Using the default answer.")
+        return default
     if not value:
         return default
     return value in {"y", "yes"}
+
+
+def pause(prompt: str = "\nPress ENTER...") -> None:
+    try:
+        input(prompt)
+    except EOFError:
+        pass
+
+
+def ensure_interactive_stdin() -> bool:
+    try:
+        if sys.stdin.isatty():
+            return True
+    except Exception:
+        pass
+    if not os.path.exists("/dev/tty") or not os.access("/dev/tty", os.R_OK):
+        return False
+    try:
+        sys.stdin = open("/dev/tty", "r", encoding="utf-8", errors="replace")
+        return True
+    except OSError:
+        return False
 
 
 def fmt_bytes(size: int) -> str:
@@ -213,14 +242,33 @@ def shell_local(
 def ssh_shell(client: paramiko.SSHClient, command: str, timeout: int = SSH_TIMEOUT) -> tuple[int, str, str]:
     stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
     channel = stdout.channel
-    channel.settimeout(timeout)
+    channel.settimeout(1.0)
+    out_chunks: list[bytes] = []
+    err_chunks: list[bytes] = []
+    deadline = time.monotonic() + timeout
     try:
-        code = channel.recv_exit_status()
-        out = stdout.read().decode("utf-8", "replace").strip()
-        err = stderr.read().decode("utf-8", "replace").strip()
-        return code, out, err
+        while not channel.exit_status_ready():
+            while channel.recv_ready():
+                out_chunks.append(channel.recv(64 * 1024))
+            while channel.recv_stderr_ready():
+                err_chunks.append(channel.recv_stderr(64 * 1024))
+            if time.monotonic() >= deadline:
+                channel.close()
+                return 124, b"".join(out_chunks).decode("utf-8","replace").strip(), b"".join(err_chunks).decode("utf-8","replace").strip() or "SSH command timed out"
+            time.sleep(0.05)
+        while channel.recv_ready():
+            out_chunks.append(channel.recv(64 * 1024))
+        while channel.recv_stderr_ready():
+            err_chunks.append(channel.recv_stderr(64 * 1024))
+        return channel.recv_exit_status(), b"".join(out_chunks).decode("utf-8","replace").strip(), b"".join(err_chunks).decode("utf-8","replace").strip()
     except socket.timeout:
-        return 124, "", "SSH command timed out"
+        channel.close()
+        return 124, b"".join(out_chunks).decode("utf-8","replace").strip(), b"".join(err_chunks).decode("utf-8","replace").strip() or "SSH command timed out"
+    finally:
+        try:
+            stdin.close()
+        except Exception:
+            pass
 
 
 def ssh_run_checked(
@@ -311,7 +359,11 @@ def parse_database_url(url: str) -> dict[str, Optional[str]]:
     )
     user = urllib.parse.unquote(parsed.username) if parsed.username else None
     password = urllib.parse.unquote(parsed.password) if parsed.password else None
-    db_name = urllib.parse.unquote(parsed.path.lstrip("/")) if parsed.path else None
+    if family == "sqlite":
+        raw_path = parsed.path or "db.sqlite3"
+        db_name = ("/" + urllib.parse.unquote(raw_path.lstrip("/"))) if raw_path.startswith("////") else urllib.parse.unquote(raw_path.lstrip("/"))
+    else:
+        db_name = urllib.parse.unquote(parsed.path.lstrip("/")) if parsed.path else None
     return {
         "family": family,
         "user": user,
@@ -329,14 +381,19 @@ def read_db_config(compose_dir: Path) -> dict[str, Optional[str]]:
         cfg = parse_database_url(url)
         if cfg["family"] != "unknown":
             return cfg
-
-    # Compatibility with older PasarGuard installations that used DB_*.
     db_user = env.get("DB_USER") or env.get("MYSQL_USER") or env.get("POSTGRES_USER") or "pasarguard"
     db_name = env.get("DB_NAME") or env.get("MYSQL_DATABASE") or env.get("POSTGRES_DB") or "pasarguard"
     service = "unknown"
-
-    if env.get("DATABASE") in {"sqlite", "sqlite3"}:
+    if env.get("DATABASE") in {"sqlite","sqlite3"}:
         service = "sqlite"
+    if service == "unknown":
+        services = list_compose_services(compose_dir)
+        if any(x in services for x in POSTGRES_CANDIDATES):
+            service = "postgres"
+        elif any(x in services for x in MYSQL_CANDIDATES):
+            service = "mysql"
+    if service == "unknown":
+        service, db_name = "sqlite", "db.sqlite3"
     return {
         "family": service,
         "user": db_user,
@@ -559,12 +616,9 @@ def wait_local_service(compose_dir: Path, service: str, family: str, timeout: in
     deadline = time.time() + timeout
     while time.time() < deadline:
         if family == "postgres":
-            cmd = f"docker compose exec -T {shlex.quote(service)} pg_isready -U \"$POSTGRES_USER\" -d postgres"
+            cmd = f"docker compose exec -T {shlex.quote(service)} sh -c 'pg_isready -U "$POSTGRES_USER" -d postgres'"
         else:
-            cmd = (
-                f"docker compose exec -T {shlex.quote(service)} "
-                f"sh -c 'mysqladmin ping -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent'"
-            )
+            cmd = f"docker compose exec -T {shlex.quote(service)} sh -c 'mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent'"
         code, _, _ = shell_local(cmd, cwd=compose_dir)
         if code == 0:
             return True
@@ -576,17 +630,9 @@ def wait_remote_service(client: paramiko.SSHClient, compose_dir: Path, service: 
     deadline = time.time() + SERVICE_READY_TIMEOUT
     while time.time() < deadline:
         if family == "postgres":
-            cmd = (
-                f"cd {shlex.quote(str(compose_dir))} && "
-                f"docker compose exec -T {shlex.quote(service)} pg_isready "
-                f"-U \"$POSTGRES_USER\" -d postgres"
-            )
+            cmd = f"cd {shlex.quote(str(compose_dir))} && docker compose exec -T {shlex.quote(service)} sh -c 'pg_isready -U "$POSTGRES_USER" -d postgres'"
         else:
-            cmd = (
-                f"cd {shlex.quote(str(compose_dir))} && "
-                f"docker compose exec -T {shlex.quote(service)} "
-                f"sh -c 'mysqladmin ping -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent'"
-            )
+            cmd = f"cd {shlex.quote(str(compose_dir))} && docker compose exec -T {shlex.quote(service)} sh -c 'mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent'"
         code, _, _ = ssh_shell(client, cmd, timeout=15)
         if code == 0:
             return True
@@ -596,7 +642,7 @@ def wait_remote_service(client: paramiko.SSHClient, compose_dir: Path, service: 
 
 def compose_up_local(compose_dir: Path, services: Optional[list[str]] = None) -> bool:
     args = ["docker", "compose", "up", "-d"] + (services or [])
-    p = run_local(args, cwd=compose_dir, capture=True)
+    p = run_local(args, cwd=compose_dir, capture=True, timeout=COMPOSE_UP_TIMEOUT)
     if p.returncode != 0:
         error(p.stderr or p.stdout)
         return False
@@ -623,7 +669,7 @@ def compose_ps_local(compose_dir: Path) -> str:
 def compose_up_remote(client: paramiko.SSHClient, compose_dir: Path, services: Optional[list[str]] = None) -> bool:
     svc = " ".join(shlex.quote(x) for x in (services or []))
     cmd = f"cd {shlex.quote(str(compose_dir))} && docker compose up -d {svc}".strip()
-    code, out, err = ssh_shell(client, cmd, timeout=60)
+    code, out, err = ssh_shell(client, cmd, timeout=REMOTE_COMPOSE_UP_TIMEOUT)
     if code != 0:
         error(err or out)
         return False
