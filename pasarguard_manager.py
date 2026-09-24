@@ -2006,6 +2006,7 @@ def restore_remote(
     disable_nodes: bool,
 ) -> None:
     # Upload to /tmp so cleaning /opt/pasarguard cannot delete the archive.
+    ensure_remote_prerequisites(client)
     remote_root = Path("/tmp/pasarguard-manager")
     remote_archive = remote_root / archive.name
 
@@ -2176,7 +2177,7 @@ def restore_remote(
     }
 
     # Re-read target .env to get the actual target password/URL.
-    target_cfg = read_db_config(PASARGUARD_DIR)
+    target_cfg = read_remote_db_config(client, PASARGUARD_DIR)
     if target_cfg.get("user"):
         cfg["user"] = target_cfg["user"]
     if target_cfg.get("database"):
@@ -2195,6 +2196,46 @@ def restore_remote(
 
         remote_dump = extract_dir / "database" / "pasarguard.sql"
         restore_database_remote(client, PASARGUARD_DIR, service, family, cfg, str(remote_dump))
+    elif family == "sqlite":
+        panel_service = resolve_panel_service_remote(client, PASARGUARD_DIR)
+        if not panel_service:
+            raise RuntimeError("Could not resolve the PasarGuard panel service for remote SQLite restore.")
+        sqlite_archive = extract_dir / str(
+            manifest["database"].get("sqlite_archive") or "database/pasarguard.sqlite3"
+        )
+        sqlite_path = str(manifest["database"].get("sqlite_path") or "db.sqlite3")
+        code,out,err=ssh_shell(
+            client,
+            f"cd {shlex.quote(str(PASARGUARD_DIR))} && docker compose pull {shlex.quote(panel_service)}",
+            timeout=REMOTE_COMPOSE_UP_TIMEOUT,
+        )
+        if code != 0:
+            raise RuntimeError(err or out or "Could not pull PasarGuard panel image")
+        code,out,err=ssh_shell(
+            client,
+            f"cd {shlex.quote(str(PASARGUARD_DIR))} && docker compose create --no-deps {shlex.quote(panel_service)}",
+            timeout=REMOTE_COMPOSE_UP_TIMEOUT,
+        )
+        if code != 0:
+            raise RuntimeError(err or out or "Could not create PasarGuard container for SQLite restore")
+        code,out,err=ssh_shell(
+            client,
+            f"cd {shlex.quote(str(PASARGUARD_DIR))} && docker compose ps -q {shlex.quote(panel_service)}",
+            timeout=30,
+        )
+        if code != 0 or not out.strip():
+            raise RuntimeError(err or out or "Could not resolve remote PasarGuard container ID")
+        container_id=out.strip().splitlines()[0]
+        code,out,err=ssh_shell(
+            client,
+            f"docker cp {shlex.quote(str(sqlite_archive))} {shlex.quote(container_id+':'+sqlite_path)}",
+            timeout=120,
+        )
+        if code != 0:
+            raise RuntimeError(err or out or "Could not copy SQLite backup into remote container")
+        code,out,err=ssh_shell(client,f"docker start {shlex.quote(container_id)}",timeout=REMOTE_COMPOSE_UP_TIMEOUT)
+        if code != 0:
+            raise RuntimeError(err or out or "Could not start PasarGuard after remote SQLite restore")
 
     if disable_nodes:
         # Best effort on target. We intentionally do not fail migration if the
@@ -2228,14 +2269,13 @@ def restore_remote(
             warn(f"Could not restore NATS volume {volume}: {err or out}")
 
     remote_check_ssl(client)
-    if not compose_up_remote(client, PASARGUARD_DIR):
-        raise RuntimeError("Remote Pasarguard stack failed to start")
-    if (PG_NODE_DIR / "docker-compose.yml").exists() or await_remote_file(client, PG_NODE_DIR / "docker-compose.yml"):
+    if not wait_for_stack_remote(client, PASARGUARD_DIR):
+        raise RuntimeError("Remote Pasarguard stack verification failed")
+    if await_remote_file(client, PG_NODE_DIR / "docker-compose.yml"):
         if not compose_up_remote(client, PG_NODE_DIR):
             raise RuntimeError("Remote PG-Node stack failed to start")
-
-    if not verify_stack_remote(client, PASARGUARD_DIR):
-        raise RuntimeError("Remote Pasarguard stack verification failed")
+        if not wait_for_stack_remote(client, PG_NODE_DIR):
+            raise RuntimeError("Remote PG-Node stack verification failed")
 
     ssh_shell(client, f"rm -rf {shlex.quote(str(remote_root))}")
     success("Remote restore completed and the Pasarguard stack is running.")
@@ -2246,19 +2286,67 @@ def await_remote_file(client: paramiko.SSHClient, path: str | Path) -> bool:
     return code == 0
 
 
-def resolve_remote_db_service(client: paramiko.SSHClient, compose_dir: Path, family: str) -> Optional[str]:
+def read_remote_db_config(client: paramiko.SSHClient, compose_dir: Path) -> dict[str, Optional[str]]:
+    env_path = compose_dir / ".env"
     code, out, _ = ssh_shell(
+        client,
+        f"test -f {shlex.quote(str(env_path))} && cat {shlex.quote(str(env_path))}",
+        timeout=30,
+    )
+    if code != 0:
+        return {}
+    values={}
+    for raw in out.splitlines():
+        line=raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key,value=line.split("=",1)
+        value=value.strip()
+        if len(value)>=2 and value[0]==value[-1] and value[0] in {"'",'"'}:
+            value=value[1:-1]
+        values[key.strip()]=value
+    url=values.get("SQLALCHEMY_DATABASE_URL")
+    if url:
+        return parse_database_url(url)
+    return {
+        "family":"sqlite",
+        "user":None,
+        "password":None,
+        "database":"db.sqlite3",
+        "host":None,
+        "port":None,
+    }
+
+
+def resolve_remote_db_service(client: paramiko.SSHClient, compose_dir: Path, family: str) -> Optional[str]:
+    code,out,_=ssh_shell(
         client,
         f"cd {shlex.quote(str(compose_dir))} && docker compose config --services",
         timeout=30,
     )
     if code != 0:
         return None
-    services = [x.strip() for x in out.splitlines() if x.strip()]
-    candidates = POSTGRES_CANDIDATES if family == "postgres" else MYSQL_CANDIDATES
+    services=[x.strip() for x in out.splitlines() if x.strip()]
+    candidates=POSTGRES_CANDIDATES if family=="postgres" else MYSQL_CANDIDATES
     for name in candidates:
         if name in services:
             return name
+    code,out,_=ssh_shell(
+        client,
+        f"cd {shlex.quote(str(compose_dir))} && docker compose config --format json",
+        timeout=30,
+    )
+    if code==0 and out:
+        try:
+            data=json.loads(out)
+            for name,service in (data.get("services") or {}).items():
+                image=str(service.get("image") or "").lower()
+                if family=="postgres" and ("postgres" in image or "timescale" in image):
+                    return str(name)
+                if family=="mysql" and ("mysql" in image or "mariadb" in image):
+                    return str(name)
+        except json.JSONDecodeError:
+            pass
     return None
 
 
