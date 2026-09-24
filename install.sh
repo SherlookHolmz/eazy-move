@@ -102,4 +102,11 @@ echo
 echo "Or simply run the installer again anytime to update it."
 echo
 
-exec "$INSTALL_DIR/run.sh" "$@"
+# Do not start the interactive application when install.sh receives its stdin from a pipe.
+# This is the normal case for: curl ... | sudo bash
+if [[ -t 0 ]]; then
+  exec "$INSTALL_DIR/run.sh" "$@"
+fi
+
+info "Installation completed. Interactive launch was skipped because stdin is not a TTY."
+echo "Run it with: sudo $INSTALL_DIR/run.sh"
