@@ -630,7 +630,7 @@ def wait_remote_service(client: paramiko.SSHClient, compose_dir: Path, service: 
     deadline = time.time() + SERVICE_READY_TIMEOUT
     while time.time() < deadline:
         if family == "postgres":
-            cmd = f"cd {shlex.quote(str(compose_dir))} && docker compose exec -T {shlex.quote(service)} sh -c 'pg_isready -U "$POSTGRES_USER" -d postgres'"
+            cmd = f"cd {shlex.quote(str(compose_dir))} && docker compose exec -T {shlex.quote(service)} sh -c 'pg_isready -U \"$POSTGRES_USER\" -d postgres'"
         else:
             cmd = f"cd {shlex.quote(str(compose_dir))} && docker compose exec -T {shlex.quote(service)} sh -c 'mysqladmin ping -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent'"
         code, _, _ = ssh_shell(client, cmd, timeout=15)
