@@ -1548,7 +1548,17 @@ def backup_create(
                 raise RuntimeError(last_err or "MySQL/MariaDB dump failed")
             dump_paths.append(dump_path)
 
-        # SQLite is already stored in /var/lib/pasarguard and is covered below.
+        elif family == "sqlite":
+            panel_service = resolve_panel_service_local(compose_dir)
+            if not panel_service:
+                raise RuntimeError("Could not resolve the PasarGuard panel service for SQLite backup.")
+            if not compose_up_local(compose_dir, [panel_service]):
+                raise RuntimeError("Could not start the PasarGuard panel service for SQLite backup.")
+            dump_path = dump_dir / "pasarguard.sqlite3"
+            sqlite_path = backup_sqlite_local(compose_dir, panel_service, cfg, dump_path)
+            manifest["database"]["sqlite_path"] = sqlite_path
+            manifest["database"]["sqlite_archive"] = str(dump_path.relative_to(work))
+            dump_paths.append(dump_path)
 
         ok, skipped, failed = copy_tree_safe(PASARGUARD_DATA_DIR, app_dir)
         if not ok:
@@ -1751,6 +1761,7 @@ def restore_local(
 
         family = str(manifest["database"]["family"])
         cfg = read_db_config(PASARGUARD_DIR)
+
         if family in {"postgres", "mysql"}:
             service = resolve_db_service(PASARGUARD_DIR, family)
             if not service:
@@ -1759,9 +1770,23 @@ def restore_local(
                 raise RuntimeError("Could not start database service.")
             if not wait_local_service(PASARGUARD_DIR, service, family):
                 raise RuntimeError("Database did not become ready.")
-
-            restore_postgres_local(PASARGUARD_DIR, service, cfg, staging / "database" / "pasarguard.sql") \
-                if family == "postgres" else restore_mysql_local(PASARGUARD_DIR, service, cfg, staging / "database" / "pasarguard.sql")
+            if family == "postgres":
+                restore_postgres_local(
+                    PASARGUARD_DIR, service, cfg, staging / "database" / "pasarguard.sql"
+                )
+            else:
+                restore_mysql_local(
+                    PASARGUARD_DIR, service, cfg, staging / "database" / "pasarguard.sql"
+                )
+        elif family == "sqlite":
+            panel_service = resolve_panel_service_local(PASARGUARD_DIR)
+            if not panel_service:
+                raise RuntimeError("Could not resolve the PasarGuard panel service for SQLite restore.")
+            sqlite_path = str(manifest["database"].get("sqlite_path") or "db.sqlite3")
+            sqlite_archive = staging / str(
+                manifest["database"].get("sqlite_archive") or "database/pasarguard.sqlite3"
+            )
+            restore_sqlite_local(PASARGUARD_DIR, panel_service, sqlite_path, sqlite_archive)
 
         if disable_nodes:
             disable_restored_nodes_local(PASARGUARD_DIR, family, cfg)
@@ -1775,7 +1800,7 @@ def restore_local(
             if not compose_up_local(PG_NODE_DIR):
                 raise RuntimeError("PG-Node stack failed to start.")
 
-        if not verify_stack_local(PASARGUARD_DIR):
+        if not wait_for_stack_local(PASARGUARD_DIR):
             raise RuntimeError("Pasarguard stack verification failed.")
 
         success("Local restore completed and the Pasarguard stack is running.")
