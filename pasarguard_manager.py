@@ -51,7 +51,7 @@ except ImportError as exc:
 
 
 APP_NAME = "PasarGuard Manager"
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 AUTHOR = "Sherlook"
 
 PASARGUARD_DIR = Path("/opt/pasarguard")
@@ -63,8 +63,11 @@ DEFAULT_BACKUP_DIR = Path.cwd()
 DEFAULT_REMOTE_DIR = Path("/tmp/pasarguard-manager")
 
 COMPOSE_DOWN_TIMEOUT = 30
+COMPOSE_UP_TIMEOUT = 600
+REMOTE_COMPOSE_UP_TIMEOUT = 900
 SERVICE_READY_TIMEOUT = 180
 STACK_READY_TIMEOUT = 180
+REMOTE_BOOTSTRAP_TIMEOUT = 600
 DATABASE_RESTORE_TIMEOUT = 3600
 SSH_TIMEOUT = 30
 SSH_BANNER_TIMEOUT = 30
@@ -131,10 +134,36 @@ def header(title: str) -> None:
 
 def ask_yes_no(prompt: str, default: bool = False) -> bool:
     suffix = "Y/n" if default else "y/N"
-    value = input(f"{C.CYAN}{prompt} [{suffix}]: {C.RESET}").strip().lower()
+    try:
+        value = input(f"{C.CYAN}{prompt} [{suffix}]: {C.RESET}").strip().lower()
+    except EOFError:
+        warn("No interactive input is available. Using the default answer.")
+        return default
     if not value:
         return default
     return value in {"y", "yes"}
+
+
+def pause(prompt: str = "\nPress ENTER...") -> None:
+    try:
+        input(prompt)
+    except EOFError:
+        pass
+
+
+def ensure_interactive_stdin() -> bool:
+    try:
+        if sys.stdin.isatty():
+            return True
+    except Exception:
+        pass
+    if not os.path.exists("/dev/tty") or not os.access("/dev/tty", os.R_OK):
+        return False
+    try:
+        sys.stdin = open("/dev/tty", "r", encoding="utf-8", errors="replace")
+        return True
+    except OSError:
+        return False
 
 
 def fmt_bytes(size: int) -> str:
@@ -213,14 +242,33 @@ def shell_local(
 def ssh_shell(client: paramiko.SSHClient, command: str, timeout: int = SSH_TIMEOUT) -> tuple[int, str, str]:
     stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
     channel = stdout.channel
-    channel.settimeout(timeout)
+    channel.settimeout(1.0)
+    out_chunks: list[bytes] = []
+    err_chunks: list[bytes] = []
+    deadline = time.monotonic() + timeout
     try:
-        code = channel.recv_exit_status()
-        out = stdout.read().decode("utf-8", "replace").strip()
-        err = stderr.read().decode("utf-8", "replace").strip()
-        return code, out, err
+        while not channel.exit_status_ready():
+            while channel.recv_ready():
+                out_chunks.append(channel.recv(64 * 1024))
+            while channel.recv_stderr_ready():
+                err_chunks.append(channel.recv_stderr(64 * 1024))
+            if time.monotonic() >= deadline:
+                channel.close()
+                return 124, b"".join(out_chunks).decode("utf-8","replace").strip(), b"".join(err_chunks).decode("utf-8","replace").strip() or "SSH command timed out"
+            time.sleep(0.05)
+        while channel.recv_ready():
+            out_chunks.append(channel.recv(64 * 1024))
+        while channel.recv_stderr_ready():
+            err_chunks.append(channel.recv_stderr(64 * 1024))
+        return channel.recv_exit_status(), b"".join(out_chunks).decode("utf-8","replace").strip(), b"".join(err_chunks).decode("utf-8","replace").strip()
     except socket.timeout:
-        return 124, "", "SSH command timed out"
+        channel.close()
+        return 124, b"".join(out_chunks).decode("utf-8","replace").strip(), b"".join(err_chunks).decode("utf-8","replace").strip() or "SSH command timed out"
+    finally:
+        try:
+            stdin.close()
+        except Exception:
+            pass
 
 
 def ssh_run_checked(
@@ -311,7 +359,11 @@ def parse_database_url(url: str) -> dict[str, Optional[str]]:
     )
     user = urllib.parse.unquote(parsed.username) if parsed.username else None
     password = urllib.parse.unquote(parsed.password) if parsed.password else None
-    db_name = urllib.parse.unquote(parsed.path.lstrip("/")) if parsed.path else None
+    if family == "sqlite":
+        raw_path = parsed.path or "db.sqlite3"
+        db_name = ("/" + urllib.parse.unquote(raw_path.lstrip("/"))) if raw_path.startswith("//") else urllib.parse.unquote(raw_path.lstrip("/"))
+    else:
+        db_name = urllib.parse.unquote(parsed.path.lstrip("/")) if parsed.path else None
     return {
         "family": family,
         "user": user,
@@ -329,14 +381,19 @@ def read_db_config(compose_dir: Path) -> dict[str, Optional[str]]:
         cfg = parse_database_url(url)
         if cfg["family"] != "unknown":
             return cfg
-
-    # Compatibility with older PasarGuard installations that used DB_*.
     db_user = env.get("DB_USER") or env.get("MYSQL_USER") or env.get("POSTGRES_USER") or "pasarguard"
     db_name = env.get("DB_NAME") or env.get("MYSQL_DATABASE") or env.get("POSTGRES_DB") or "pasarguard"
     service = "unknown"
-
-    if env.get("DATABASE") in {"sqlite", "sqlite3"}:
+    if env.get("DATABASE") in {"sqlite","sqlite3"}:
         service = "sqlite"
+    if service == "unknown":
+        services = list_compose_services(compose_dir)
+        if any(x in services for x in POSTGRES_CANDIDATES):
+            service = "postgres"
+        elif any(x in services for x in MYSQL_CANDIDATES):
+            service = "mysql"
+    if service == "unknown":
+        service, db_name = "sqlite", "db.sqlite3"
     return {
         "family": service,
         "user": db_user,
@@ -559,12 +616,9 @@ def wait_local_service(compose_dir: Path, service: str, family: str, timeout: in
     deadline = time.time() + timeout
     while time.time() < deadline:
         if family == "postgres":
-            cmd = f"docker compose exec -T {shlex.quote(service)} pg_isready -U \"$POSTGRES_USER\" -d postgres"
+            cmd = f"docker compose exec -T {shlex.quote(service)} sh -c 'pg_isready -U \"$POSTGRES_USER\" -d postgres'"
         else:
-            cmd = (
-                f"docker compose exec -T {shlex.quote(service)} "
-                f"sh -c 'mysqladmin ping -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent'"
-            )
+            cmd = f"docker compose exec -T {shlex.quote(service)} sh -c 'mysqladmin ping -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent'"
         code, _, _ = shell_local(cmd, cwd=compose_dir)
         if code == 0:
             return True
@@ -576,17 +630,9 @@ def wait_remote_service(client: paramiko.SSHClient, compose_dir: Path, service: 
     deadline = time.time() + SERVICE_READY_TIMEOUT
     while time.time() < deadline:
         if family == "postgres":
-            cmd = (
-                f"cd {shlex.quote(str(compose_dir))} && "
-                f"docker compose exec -T {shlex.quote(service)} pg_isready "
-                f"-U \"$POSTGRES_USER\" -d postgres"
-            )
+            cmd = f"cd {shlex.quote(str(compose_dir))} && docker compose exec -T {shlex.quote(service)} sh -c 'pg_isready -U \"$POSTGRES_USER\" -d postgres'"
         else:
-            cmd = (
-                f"cd {shlex.quote(str(compose_dir))} && "
-                f"docker compose exec -T {shlex.quote(service)} "
-                f"sh -c 'mysqladmin ping -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent'"
-            )
+            cmd = f"cd {shlex.quote(str(compose_dir))} && docker compose exec -T {shlex.quote(service)} sh -c 'mysqladmin ping -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent'"
         code, _, _ = ssh_shell(client, cmd, timeout=15)
         if code == 0:
             return True
@@ -596,7 +642,7 @@ def wait_remote_service(client: paramiko.SSHClient, compose_dir: Path, service: 
 
 def compose_up_local(compose_dir: Path, services: Optional[list[str]] = None) -> bool:
     args = ["docker", "compose", "up", "-d"] + (services or [])
-    p = run_local(args, cwd=compose_dir, capture=True)
+    p = run_local(args, cwd=compose_dir, capture=True, timeout=COMPOSE_UP_TIMEOUT)
     if p.returncode != 0:
         error(p.stderr or p.stdout)
         return False
@@ -623,7 +669,7 @@ def compose_ps_local(compose_dir: Path) -> str:
 def compose_up_remote(client: paramiko.SSHClient, compose_dir: Path, services: Optional[list[str]] = None) -> bool:
     svc = " ".join(shlex.quote(x) for x in (services or []))
     cmd = f"cd {shlex.quote(str(compose_dir))} && docker compose up -d {svc}".strip()
-    code, out, err = ssh_shell(client, cmd, timeout=60)
+    code, out, err = ssh_shell(client, cmd, timeout=REMOTE_COMPOSE_UP_TIMEOUT)
     if code != 0:
         error(err or out)
         return False
@@ -694,6 +740,170 @@ def verify_stack_remote(client: paramiko.SSHClient, compose_dir: Path) -> bool:
         if health and health not in {"healthy", "running"}:
             good = False
     return good
+
+
+def resolve_panel_service_local(compose_dir: Path) -> Optional[str]:
+    services = list_compose_services(compose_dir)
+    if "pasarguard" in services:
+        return "pasarguard"
+    code, out, _ = shell_local("docker compose config --format json", cwd=compose_dir)
+    if code == 0 and out:
+        try:
+            data = json.loads(out)
+            for name, service in (data.get("services") or {}).items():
+                if "pasarguard/panel" in str(service.get("image") or "").lower():
+                    return str(name)
+        except json.JSONDecodeError:
+            pass
+    for name in services:
+        if "panel" in name.lower() or "pasarguard" in name.lower():
+            return name
+    return services[0] if services else None
+
+
+def resolve_panel_service_remote(client: paramiko.SSHClient, compose_dir: Path) -> Optional[str]:
+    code, out, _ = ssh_shell(
+        client,
+        f"cd {shlex.quote(str(compose_dir))} && docker compose config --services",
+        timeout=30,
+    )
+    if code != 0:
+        return None
+    services=[x.strip() for x in out.splitlines() if x.strip()]
+    if "pasarguard" in services:
+        return "pasarguard"
+    code, out, _ = ssh_shell(
+        client,
+        f"cd {shlex.quote(str(compose_dir))} && docker compose config --format json",
+        timeout=30,
+    )
+    if code == 0 and out:
+        try:
+            data=json.loads(out)
+            for name, service in (data.get("services") or {}).items():
+                if "pasarguard/panel" in str(service.get("image") or "").lower():
+                    return str(name)
+        except json.JSONDecodeError:
+            pass
+    for name in services:
+        if "panel" in name.lower() or "pasarguard" in name.lower():
+            return name
+    return services[0] if services else None
+
+
+def sqlite_container_path_local(compose_dir: Path, service: str, cfg: dict) -> str:
+    db_path=str(cfg.get("database") or "db.sqlite3")
+    if db_path.startswith("/"):
+        return db_path
+    code,out,err=shell_local(
+        f"docker compose exec -T {shlex.quote(service)} pwd",
+        cwd=compose_dir,
+    )
+    if code != 0 or not out:
+        raise RuntimeError(f"Could not resolve PasarGuard container working directory: {err or out}")
+    return str(Path(out.strip()) / db_path)
+
+
+def backup_sqlite_local(compose_dir: Path, service: str, cfg: dict, dump_path: Path) -> str:
+    container_path=sqlite_container_path_local(compose_dir,service,cfg)
+    temp_path=f"/tmp/pasarguard_manager_{uuid.uuid4().hex}.sqlite3"
+    py=(
+        "import sqlite3; "
+        f"src=sqlite3.connect({container_path!r}); "
+        f"dst=sqlite3.connect({temp_path!r}); "
+        "src.backup(dst); dst.close(); src.close()"
+    )
+    code,out,err=shell_local(
+        f"docker compose exec -T {shlex.quote(service)} python -c {shell_single_quote(py)}",
+        cwd=compose_dir, timeout=DATABASE_RESTORE_TIMEOUT
+    )
+    if code != 0:
+        raise RuntimeError(err or out or "SQLite backup failed")
+    code,cid,err=shell_local(f"docker compose ps -q {shlex.quote(service)}",cwd=compose_dir)
+    if code != 0 or not cid.strip():
+        raise RuntimeError(err or cid or "Could not resolve PasarGuard container ID")
+    try:
+        code,out,err=shell_local(
+            f"docker cp {shlex.quote(cid.strip())}:{shlex.quote(temp_path)} {shlex.quote(str(dump_path))}",
+            timeout=120
+        )
+        if code != 0:
+            raise RuntimeError(err or out or "Could not copy SQLite backup out of the container")
+    finally:
+        shell_local(f"docker compose exec -T {shlex.quote(service)} rm -f {shlex.quote(temp_path)}",cwd=compose_dir)
+    return container_path
+
+
+def restore_sqlite_local(compose_dir: Path, service: str, container_path: str, dump_path: Path) -> None:
+    if not dump_path.is_file():
+        raise RuntimeError(f"Missing SQLite backup member: {dump_path}")
+    code,out,err=shell_local(
+        f"docker compose pull {shlex.quote(service)}",
+        cwd=compose_dir, timeout=REMOTE_COMPOSE_UP_TIMEOUT
+    )
+    if code != 0:
+        raise RuntimeError(err or out or "Could not pull PasarGuard panel image")
+    code,out,err=shell_local(
+        f"docker compose create --no-deps {shlex.quote(service)}",
+        cwd=compose_dir, timeout=COMPOSE_UP_TIMEOUT
+    )
+    if code != 0:
+        raise RuntimeError(err or out or "Could not create PasarGuard container for SQLite restore")
+    code,cid,err=shell_local(f"docker compose ps -q {shlex.quote(service)}",cwd=compose_dir)
+    if code != 0 or not cid.strip():
+        raise RuntimeError(err or cid or "Could not resolve PasarGuard container ID")
+    cid=cid.strip().splitlines()[0]
+    code,out,err=shell_local(
+        f"docker cp {shlex.quote(str(dump_path))} {shlex.quote(cid+':'+container_path)}",
+        timeout=120
+    )
+    if code != 0:
+        raise RuntimeError(err or out or "Could not copy SQLite backup into the container")
+    code,out,err=shell_local(f"docker start {shlex.quote(cid)}",timeout=COMPOSE_UP_TIMEOUT)
+    if code != 0:
+        raise RuntimeError(err or out or "Could not start PasarGuard after SQLite restore")
+
+
+def ensure_remote_prerequisites(client: paramiko.SSHClient) -> None:
+    code,_,_=ssh_shell(client,'test "$(id -u)" -eq 0',timeout=15)
+    if code != 0:
+        raise RuntimeError("Remote migration requires root SSH access.")
+    checks={
+        "docker":"command -v docker",
+        "docker compose":"docker compose version",
+        "python3":"command -v python3",
+        "tar":"command -v tar",
+        "sha256sum":"command -v sha256sum",
+    }
+    missing=[]
+    for label,command in checks.items():
+        code,_,_=ssh_shell(client,command,timeout=15)
+        if code != 0:
+            missing.append(label)
+    if not missing:
+        return
+    bootstrap=(
+        "export DEBIAN_FRONTEND=noninteractive; "
+        "command -v apt-get >/dev/null 2>&1 || { echo 'Ubuntu/Debian apt-get is required on the target.'; exit 1; }; "
+        "apt-get update -y >/dev/null && "
+        "apt-get install -y ca-certificates curl python3 tar coreutils >/dev/null; "
+        "if ! command -v docker >/dev/null 2>&1; then "
+        " if apt-cache show docker.io >/dev/null 2>&1; then apt-get install -y docker.io >/dev/null; "
+        " else curl -fsSL https://get.docker.com | sh; fi; "
+        "fi; "
+        "systemctl enable --now docker >/dev/null 2>&1 || true; "
+        "if ! docker compose version >/dev/null 2>&1; then "
+        " if apt-cache show docker-compose-v2 >/dev/null 2>&1; then apt-get install -y docker-compose-v2 >/dev/null; "
+        " elif apt-cache show docker-compose-plugin >/dev/null 2>&1; then apt-get install -y docker-compose-plugin >/dev/null; "
+        " else curl -fsSL https://get.docker.com | sh; fi; "
+        "fi; "
+        "docker compose version >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 && "
+        "command -v tar >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1"
+    )
+    info(f"Preparing remote prerequisites: {', '.join(missing)}")
+    code,out,err=ssh_shell(client,bootstrap,timeout=REMOTE_BOOTSTRAP_TIMEOUT)
+    if code != 0:
+        raise RuntimeError(err or out or "Failed to prepare remote Docker environment")
 
 
 def ensure_target_dirs_local() -> None:
@@ -1338,7 +1548,17 @@ def backup_create(
                 raise RuntimeError(last_err or "MySQL/MariaDB dump failed")
             dump_paths.append(dump_path)
 
-        # SQLite is already stored in /var/lib/pasarguard and is covered below.
+        elif family == "sqlite":
+            panel_service = resolve_panel_service_local(compose_dir)
+            if not panel_service:
+                raise RuntimeError("Could not resolve the PasarGuard panel service for SQLite backup.")
+            if not compose_up_local(compose_dir, [panel_service]):
+                raise RuntimeError("Could not start the PasarGuard panel service for SQLite backup.")
+            dump_path = dump_dir / "pasarguard.sqlite3"
+            sqlite_path = backup_sqlite_local(compose_dir, panel_service, cfg, dump_path)
+            manifest["database"]["sqlite_path"] = sqlite_path
+            manifest["database"]["sqlite_archive"] = str(dump_path.relative_to(work))
+            dump_paths.append(dump_path)
 
         ok, skipped, failed = copy_tree_safe(PASARGUARD_DATA_DIR, app_dir)
         if not ok:
@@ -1541,6 +1761,7 @@ def restore_local(
 
         family = str(manifest["database"]["family"])
         cfg = read_db_config(PASARGUARD_DIR)
+
         if family in {"postgres", "mysql"}:
             service = resolve_db_service(PASARGUARD_DIR, family)
             if not service:
@@ -1549,9 +1770,23 @@ def restore_local(
                 raise RuntimeError("Could not start database service.")
             if not wait_local_service(PASARGUARD_DIR, service, family):
                 raise RuntimeError("Database did not become ready.")
-
-            restore_postgres_local(PASARGUARD_DIR, service, cfg, staging / "database" / "pasarguard.sql") \
-                if family == "postgres" else restore_mysql_local(PASARGUARD_DIR, service, cfg, staging / "database" / "pasarguard.sql")
+            if family == "postgres":
+                restore_postgres_local(
+                    PASARGUARD_DIR, service, cfg, staging / "database" / "pasarguard.sql"
+                )
+            else:
+                restore_mysql_local(
+                    PASARGUARD_DIR, service, cfg, staging / "database" / "pasarguard.sql"
+                )
+        elif family == "sqlite":
+            panel_service = resolve_panel_service_local(PASARGUARD_DIR)
+            if not panel_service:
+                raise RuntimeError("Could not resolve the PasarGuard panel service for SQLite restore.")
+            sqlite_path = str(manifest["database"].get("sqlite_path") or "db.sqlite3")
+            sqlite_archive = staging / str(
+                manifest["database"].get("sqlite_archive") or "database/pasarguard.sqlite3"
+            )
+            restore_sqlite_local(PASARGUARD_DIR, panel_service, sqlite_path, sqlite_archive)
 
         if disable_nodes:
             disable_restored_nodes_local(PASARGUARD_DIR, family, cfg)
@@ -1565,7 +1800,7 @@ def restore_local(
             if not compose_up_local(PG_NODE_DIR):
                 raise RuntimeError("PG-Node stack failed to start.")
 
-        if not verify_stack_local(PASARGUARD_DIR):
+        if not wait_for_stack_local(PASARGUARD_DIR):
             raise RuntimeError("Pasarguard stack verification failed.")
 
         success("Local restore completed and the Pasarguard stack is running.")
@@ -1629,6 +1864,24 @@ def check_ssl_paths_local() -> None:
             warn(f"  {key} -> {value}")
     else:
         info("SSL path check passed (or panel SSL is not configured directly).")
+
+
+def wait_for_stack_local(compose_dir: Path, timeout: int = STACK_READY_TIMEOUT) -> bool:
+    deadline=time.time()+timeout
+    while time.time()<deadline:
+        if verify_stack_local(compose_dir):
+            return True
+        time.sleep(3)
+    return False
+
+
+def wait_for_stack_remote(client: paramiko.SSHClient, compose_dir: Path, timeout: int = STACK_READY_TIMEOUT) -> bool:
+    deadline=time.time()+timeout
+    while time.time()<deadline:
+        if verify_stack_remote(client,compose_dir):
+            return True
+        time.sleep(3)
+    return False
 
 
 def preflight_local(db_override: Optional[str] = None) -> bool:
@@ -1753,6 +2006,7 @@ def restore_remote(
     disable_nodes: bool,
 ) -> None:
     # Upload to /tmp so cleaning /opt/pasarguard cannot delete the archive.
+    ensure_remote_prerequisites(client)
     remote_root = Path("/tmp/pasarguard-manager")
     remote_archive = remote_root / archive.name
 
@@ -1923,7 +2177,7 @@ def restore_remote(
     }
 
     # Re-read target .env to get the actual target password/URL.
-    target_cfg = read_db_config(PASARGUARD_DIR)
+    target_cfg = read_remote_db_config(client, PASARGUARD_DIR)
     if target_cfg.get("user"):
         cfg["user"] = target_cfg["user"]
     if target_cfg.get("database"):
@@ -1942,6 +2196,46 @@ def restore_remote(
 
         remote_dump = extract_dir / "database" / "pasarguard.sql"
         restore_database_remote(client, PASARGUARD_DIR, service, family, cfg, str(remote_dump))
+    elif family == "sqlite":
+        panel_service = resolve_panel_service_remote(client, PASARGUARD_DIR)
+        if not panel_service:
+            raise RuntimeError("Could not resolve the PasarGuard panel service for remote SQLite restore.")
+        sqlite_archive = extract_dir / str(
+            manifest["database"].get("sqlite_archive") or "database/pasarguard.sqlite3"
+        )
+        sqlite_path = str(manifest["database"].get("sqlite_path") or "db.sqlite3")
+        code,out,err=ssh_shell(
+            client,
+            f"cd {shlex.quote(str(PASARGUARD_DIR))} && docker compose pull {shlex.quote(panel_service)}",
+            timeout=REMOTE_COMPOSE_UP_TIMEOUT,
+        )
+        if code != 0:
+            raise RuntimeError(err or out or "Could not pull PasarGuard panel image")
+        code,out,err=ssh_shell(
+            client,
+            f"cd {shlex.quote(str(PASARGUARD_DIR))} && docker compose create --no-deps {shlex.quote(panel_service)}",
+            timeout=REMOTE_COMPOSE_UP_TIMEOUT,
+        )
+        if code != 0:
+            raise RuntimeError(err or out or "Could not create PasarGuard container for SQLite restore")
+        code,out,err=ssh_shell(
+            client,
+            f"cd {shlex.quote(str(PASARGUARD_DIR))} && docker compose ps -q {shlex.quote(panel_service)}",
+            timeout=30,
+        )
+        if code != 0 or not out.strip():
+            raise RuntimeError(err or out or "Could not resolve remote PasarGuard container ID")
+        container_id=out.strip().splitlines()[0]
+        code,out,err=ssh_shell(
+            client,
+            f"docker cp {shlex.quote(str(sqlite_archive))} {shlex.quote(container_id+':'+sqlite_path)}",
+            timeout=120,
+        )
+        if code != 0:
+            raise RuntimeError(err or out or "Could not copy SQLite backup into remote container")
+        code,out,err=ssh_shell(client,f"docker start {shlex.quote(container_id)}",timeout=REMOTE_COMPOSE_UP_TIMEOUT)
+        if code != 0:
+            raise RuntimeError(err or out or "Could not start PasarGuard after remote SQLite restore")
 
     if disable_nodes:
         # Best effort on target. We intentionally do not fail migration if the
@@ -1977,12 +2271,13 @@ def restore_remote(
     remote_check_ssl(client)
     if not compose_up_remote(client, PASARGUARD_DIR):
         raise RuntimeError("Remote Pasarguard stack failed to start")
-    if (PG_NODE_DIR / "docker-compose.yml").exists() or await_remote_file(client, PG_NODE_DIR / "docker-compose.yml"):
+    if not wait_for_stack_remote(client, PASARGUARD_DIR):
+        raise RuntimeError("Remote Pasarguard stack verification failed")
+    if await_remote_file(client, PG_NODE_DIR / "docker-compose.yml"):
         if not compose_up_remote(client, PG_NODE_DIR):
             raise RuntimeError("Remote PG-Node stack failed to start")
-
-    if not verify_stack_remote(client, PASARGUARD_DIR):
-        raise RuntimeError("Remote Pasarguard stack verification failed")
+        if not wait_for_stack_remote(client, PG_NODE_DIR):
+            raise RuntimeError("Remote PG-Node stack verification failed")
 
     ssh_shell(client, f"rm -rf {shlex.quote(str(remote_root))}")
     success("Remote restore completed and the Pasarguard stack is running.")
@@ -1993,19 +2288,67 @@ def await_remote_file(client: paramiko.SSHClient, path: str | Path) -> bool:
     return code == 0
 
 
-def resolve_remote_db_service(client: paramiko.SSHClient, compose_dir: Path, family: str) -> Optional[str]:
+def read_remote_db_config(client: paramiko.SSHClient, compose_dir: Path) -> dict[str, Optional[str]]:
+    env_path = compose_dir / ".env"
     code, out, _ = ssh_shell(
+        client,
+        f"test -f {shlex.quote(str(env_path))} && cat {shlex.quote(str(env_path))}",
+        timeout=30,
+    )
+    if code != 0:
+        return {}
+    values={}
+    for raw in out.splitlines():
+        line=raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key,value=line.split("=",1)
+        value=value.strip()
+        if len(value)>=2 and value[0]==value[-1] and value[0] in {"'",'"'}:
+            value=value[1:-1]
+        values[key.strip()]=value
+    url=values.get("SQLALCHEMY_DATABASE_URL")
+    if url:
+        return parse_database_url(url)
+    return {
+        "family":"sqlite",
+        "user":None,
+        "password":None,
+        "database":"db.sqlite3",
+        "host":None,
+        "port":None,
+    }
+
+
+def resolve_remote_db_service(client: paramiko.SSHClient, compose_dir: Path, family: str) -> Optional[str]:
+    code,out,_=ssh_shell(
         client,
         f"cd {shlex.quote(str(compose_dir))} && docker compose config --services",
         timeout=30,
     )
     if code != 0:
         return None
-    services = [x.strip() for x in out.splitlines() if x.strip()]
-    candidates = POSTGRES_CANDIDATES if family == "postgres" else MYSQL_CANDIDATES
+    services=[x.strip() for x in out.splitlines() if x.strip()]
+    candidates=POSTGRES_CANDIDATES if family=="postgres" else MYSQL_CANDIDATES
     for name in candidates:
         if name in services:
             return name
+    code,out,_=ssh_shell(
+        client,
+        f"cd {shlex.quote(str(compose_dir))} && docker compose config --format json",
+        timeout=30,
+    )
+    if code==0 and out:
+        try:
+            data=json.loads(out)
+            for name,service in (data.get("services") or {}).items():
+                image=str(service.get("image") or "").lower()
+                if family=="postgres" and ("postgres" in image or "timescale" in image):
+                    return str(name)
+                if family=="mysql" and ("mysql" in image or "mariadb" in image):
+                    return str(name)
+        except json.JSONDecodeError:
+            pass
     return None
 
 
@@ -2194,29 +2537,37 @@ def interactive_menu() -> None:
         print("  5) 🤖 Telegram Backup Scheduler")
         print("  6) 🚪 Exit\n")
 
-        choice = input(f"{C.CYAN}Select [1-6]: {C.RESET}").strip()
+        try:
+            choice=input(f"{C.CYAN}Select [1-6]: {C.RESET}").strip()
+        except EOFError:
+            warn("Interactive input closed. Exiting.")
+            return
 
         try:
-            if choice == "1":
+            if choice=="1":
                 preflight_local()
-                input("\nPress ENTER...")
-            elif choice == "2":
-                db = input("Database [auto/postgres/mysql/sqlite]: ").strip().lower() or None
-                archive = backup_create(backup_dir=DEFAULT_BACKUP_DIR, db_family=db)
+                pause()
+            elif choice=="2":
+                db=input("Database [auto/postgres/mysql/sqlite]: ").strip().lower() or None
+                archive=backup_create(backup_dir=DEFAULT_BACKUP_DIR,db_family=db)
                 print(f"\nBackup: {archive}")
-                input("\nPress ENTER...")
-            elif choice == "3":
-                archive = Path(input("Backup ZIP path: ").strip())
-                restore_local(archive, force=False, disable_nodes=ask_yes_no("Disable restored nodes before panel startup?", True))
-                input("\nPress ENTER...")
-            elif choice == "4":
-                host = input("New server IP/hostname: ").strip()
-                port_text = input("SSH port [22]: ").strip() or "22"
-                username = input("SSH username [root]: ").strip() or "root"
-                use_key = input("SSH private key path (leave empty for password): ").strip()
-                password = None if use_key else getpass.getpass("SSH password: ")
-                archive_choice = input("Use existing backup ZIP path (leave empty to create a new one): ").strip()
-                archive = Path(archive_choice) if archive_choice else None
+                pause()
+            elif choice=="3":
+                archive=Path(input("Backup ZIP path: ").strip())
+                restore_local(
+                    archive,
+                    force=False,
+                    disable_nodes=ask_yes_no("Disable restored nodes before panel startup?",True),
+                )
+                pause()
+            elif choice=="4":
+                host=input("New server IP/hostname: ").strip()
+                port_text=input("SSH port [22]: ").strip() or "22"
+                username=input("SSH username [root]: ").strip() or "root"
+                use_key=input("SSH private key path (leave empty for password): ").strip()
+                password=None if use_key else getpass.getpass("SSH password: ")
+                archive_choice=input("Use existing backup ZIP path (leave empty to create a new one): ").strip()
+                archive=Path(archive_choice) if archive_choice else None
                 migrate(
                     archive=archive,
                     host=host,
@@ -2224,29 +2575,32 @@ def interactive_menu() -> None:
                     username=username,
                     password=password,
                     key_file=Path(use_key) if use_key else None,
-                    accept_new_host_key=ask_yes_no("Accept a new SSH host key?", False),
+                    accept_new_host_key=ask_yes_no("Accept a new SSH host key?",False),
                     force=False,
-                    disable_nodes=ask_yes_no("Disable restored nodes before panel startup?", True),
+                    disable_nodes=ask_yes_no("Disable restored nodes before panel startup?",True),
                 )
-                input("\nPress ENTER...")
-            elif choice == "5":
-                token = getpass.getpass("Telegram bot token: ")
-                chat_id = input("Telegram chat ID: ").strip()
-                hours = float(input("Interval hours [6]: ").strip() or "6")
-                schedule_telegram(hours, token, chat_id)
-            elif choice == "6":
+                pause()
+            elif choice=="5":
+                token=getpass.getpass("Telegram bot token: ")
+                chat_id=input("Telegram chat ID: ").strip()
+                hours=float(input("Interval hours [6]: ").strip() or "6")
+                schedule_telegram(hours,token,chat_id)
+            elif choice=="6":
                 print("Bye.")
                 return
             else:
                 warn("Invalid option.")
                 time.sleep(1)
+        except EOFError:
+            warn("Interactive input closed. Exiting.")
+            return
         except KeyboardInterrupt:
             print()
             warn("Operation cancelled.")
             time.sleep(1)
         except Exception as exc:
             error(str(exc))
-            input("\nPress ENTER...")
+            pause()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2298,6 +2652,9 @@ def main() -> int:
         return 1
 
     if not args.command:
+        if not ensure_interactive_stdin():
+            error("No interactive terminal is available. Use a CLI subcommand such as 'check', 'backup', 'restore', or 'migrate'.")
+            return 2
         interactive_menu()
         return 0
 
