@@ -618,7 +618,7 @@ def wait_local_service(compose_dir: Path, service: str, family: str, timeout: in
         if family == "postgres":
             cmd = f"docker compose exec -T {shlex.quote(service)} sh -c 'pg_isready -U \"$POSTGRES_USER\" -d postgres'"
         else:
-            cmd = f"docker compose exec -T {shlex.quote(service)} sh -c 'mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent'"
+            cmd = f"docker compose exec -T {shlex.quote(service)} sh -c 'mysqladmin ping -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent'"
         code, _, _ = shell_local(cmd, cwd=compose_dir)
         if code == 0:
             return True
@@ -632,7 +632,7 @@ def wait_remote_service(client: paramiko.SSHClient, compose_dir: Path, service: 
         if family == "postgres":
             cmd = f"cd {shlex.quote(str(compose_dir))} && docker compose exec -T {shlex.quote(service)} sh -c 'pg_isready -U "$POSTGRES_USER" -d postgres'"
         else:
-            cmd = f"cd {shlex.quote(str(compose_dir))} && docker compose exec -T {shlex.quote(service)} sh -c 'mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent'"
+            cmd = f"cd {shlex.quote(str(compose_dir))} && docker compose exec -T {shlex.quote(service)} sh -c 'mysqladmin ping -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent'"
         code, _, _ = ssh_shell(client, cmd, timeout=15)
         if code == 0:
             return True
