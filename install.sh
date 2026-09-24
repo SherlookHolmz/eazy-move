@@ -60,10 +60,12 @@ evaluate_source_dir(){
 }
 
 SOURCE_DIR=""
-# A piped invocation such as "curl ... | sudo bash" must never trust the
-# current directory as the source. Otherwise an old local install.sh can
-# update only the virtualenv and then launch stale project files.
-if [[ -t 0 ]] && SOURCE_DIR="$(evaluate_source_dir 2>/dev/null)"; then
+SCRIPT_PATH="${BASH_SOURCE[0]:-}"
+# Only use local project files when this is a real script file executed from
+# a TTY. With "curl ... | sudo bash", BASH_SOURCE may be empty, while the
+# current directory can still contain an old checkout. Never use that as
+# the source for a piped install.
+if [[ -t 0 && -n "$SCRIPT_PATH" && -f "$SCRIPT_PATH" ]] && SOURCE_DIR="$(evaluate_source_dir 2>/dev/null)"; then
   info "Using the local project files."
 else
   info "Downloading the project from GitHub..."
