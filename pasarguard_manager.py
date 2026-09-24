@@ -414,10 +414,11 @@ def capture_postgres_runtime(compose_dir: Path, service: str) -> dict[str, objec
     if not container_id:
         raise RuntimeError(err or "Could not find the running database container.")
 
-    code, out, err = shell_local(
-        f"docker inspect -f '{{{{.Config.Image}}}}|{{{{join .RepoDigests ","}}}}' {shlex.quote(container_id)}",
-        timeout=30,
+    inspect_cmd = (
+        "docker inspect -f '{{.Config.Image}}|{{join .RepoDigests \",\"}}' "
+        f"{shlex.quote(container_id)}"
     )
+    code, out, err = shell_local(inspect_cmd, timeout=30)
     if code != 0 or not out.strip():
         raise RuntimeError(err or "Could not inspect the source database container.")
     image, _, digests = out.strip().partition("|")
