@@ -60,16 +60,19 @@ evaluate_source_dir(){
 }
 
 SOURCE_DIR=""
-if SOURCE_DIR="$(evaluate_source_dir 2>/dev/null)"; then
+# A piped invocation such as "curl ... | sudo bash" must never trust the
+# current directory as the source. Otherwise an old local install.sh can
+# update only the virtualenv and then launch stale project files.
+if [[ -t 0 ]] && SOURCE_DIR="$(evaluate_source_dir 2>/dev/null)"; then
   info "Using the local project files."
 else
   info "Downloading the project from GitHub..."
   if [[ -d "${INSTALL_DIR}/.git" ]]; then
-    git -C "$INSTALL_DIR" fetch --depth=1 origin main >/dev/null 2>&1 || true
-    git -C "$INSTALL_DIR" reset --hard origin/main >/dev/null 2>&1 || true
+    git -C "$INSTALL_DIR" fetch --depth=1 origin main
+    git -C "$INSTALL_DIR" reset --hard origin/main
   else
     rm -rf "$INSTALL_DIR"
-    git clone --depth=1 "$REPO_URL" "$INSTALL_DIR" >/dev/null
+    git clone --depth=1 "$REPO_URL" "$INSTALL_DIR"
   fi
   SOURCE_DIR="$INSTALL_DIR"
 fi
