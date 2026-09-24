@@ -742,6 +742,170 @@ def verify_stack_remote(client: paramiko.SSHClient, compose_dir: Path) -> bool:
     return good
 
 
+def resolve_panel_service_local(compose_dir: Path) -> Optional[str]:
+    services = list_compose_services(compose_dir)
+    if "pasarguard" in services:
+        return "pasarguard"
+    code, out, _ = shell_local("docker compose config --format json", cwd=compose_dir)
+    if code == 0 and out:
+        try:
+            data = json.loads(out)
+            for name, service in (data.get("services") or {}).items():
+                if "pasarguard/panel" in str(service.get("image") or "").lower():
+                    return str(name)
+        except json.JSONDecodeError:
+            pass
+    for name in services:
+        if "panel" in name.lower() or "pasarguard" in name.lower():
+            return name
+    return services[0] if services else None
+
+
+def resolve_panel_service_remote(client: paramiko.SSHClient, compose_dir: Path) -> Optional[str]:
+    code, out, _ = ssh_shell(
+        client,
+        f"cd {shlex.quote(str(compose_dir))} && docker compose config --services",
+        timeout=30,
+    )
+    if code != 0:
+        return None
+    services=[x.strip() for x in out.splitlines() if x.strip()]
+    if "pasarguard" in services:
+        return "pasarguard"
+    code, out, _ = ssh_shell(
+        client,
+        f"cd {shlex.quote(str(compose_dir))} && docker compose config --format json",
+        timeout=30,
+    )
+    if code == 0 and out:
+        try:
+            data=json.loads(out)
+            for name, service in (data.get("services") or {}).items():
+                if "pasarguard/panel" in str(service.get("image") or "").lower():
+                    return str(name)
+        except json.JSONDecodeError:
+            pass
+    for name in services:
+        if "panel" in name.lower() or "pasarguard" in name.lower():
+            return name
+    return services[0] if services else None
+
+
+def sqlite_container_path_local(compose_dir: Path, service: str, cfg: dict) -> str:
+    db_path=str(cfg.get("database") or "db.sqlite3")
+    if db_path.startswith("/"):
+        return db_path
+    code,out,err=shell_local(
+        f"docker compose exec -T {shlex.quote(service)} pwd",
+        cwd=compose_dir,
+    )
+    if code != 0 or not out:
+        raise RuntimeError(f"Could not resolve PasarGuard container working directory: {err or out}")
+    return str(Path(out.strip()) / db_path)
+
+
+def backup_sqlite_local(compose_dir: Path, service: str, cfg: dict, dump_path: Path) -> str:
+    container_path=sqlite_container_path_local(compose_dir,service,cfg)
+    temp_path=f"/tmp/pasarguard_manager_{uuid.uuid4().hex}.sqlite3"
+    py=(
+        "import sqlite3; "
+        f"src=sqlite3.connect({container_path!r}); "
+        f"dst=sqlite3.connect({temp_path!r}); "
+        "src.backup(dst); dst.close(); src.close()"
+    )
+    code,out,err=shell_local(
+        f"docker compose exec -T {shlex.quote(service)} python -c {shell_single_quote(py)}",
+        cwd=compose_dir, timeout=DATABASE_RESTORE_TIMEOUT
+    )
+    if code != 0:
+        raise RuntimeError(err or out or "SQLite backup failed")
+    code,cid,err=shell_local(f"docker compose ps -q {shlex.quote(service)}",cwd=compose_dir)
+    if code != 0 or not cid.strip():
+        raise RuntimeError(err or cid or "Could not resolve PasarGuard container ID")
+    try:
+        code,out,err=shell_local(
+            f"docker cp {shlex.quote(cid.strip())}:{shlex.quote(temp_path)} {shlex.quote(str(dump_path))}",
+            timeout=120
+        )
+        if code != 0:
+            raise RuntimeError(err or out or "Could not copy SQLite backup out of the container")
+    finally:
+        shell_local(f"docker compose exec -T {shlex.quote(service)} rm -f {shlex.quote(temp_path)}",cwd=compose_dir)
+    return container_path
+
+
+def restore_sqlite_local(compose_dir: Path, service: str, container_path: str, dump_path: Path) -> None:
+    if not dump_path.is_file():
+        raise RuntimeError(f"Missing SQLite backup member: {dump_path}")
+    code,out,err=shell_local(
+        f"docker compose pull {shlex.quote(service)}",
+        cwd=compose_dir, timeout=REMOTE_COMPOSE_UP_TIMEOUT
+    )
+    if code != 0:
+        raise RuntimeError(err or out or "Could not pull PasarGuard panel image")
+    code,out,err=shell_local(
+        f"docker compose create --no-deps {shlex.quote(service)}",
+        cwd=compose_dir, timeout=COMPOSE_UP_TIMEOUT
+    )
+    if code != 0:
+        raise RuntimeError(err or out or "Could not create PasarGuard container for SQLite restore")
+    code,cid,err=shell_local(f"docker compose ps -q {shlex.quote(service)}",cwd=compose_dir)
+    if code != 0 or not cid.strip():
+        raise RuntimeError(err or cid or "Could not resolve PasarGuard container ID")
+    cid=cid.strip().splitlines()[0]
+    code,out,err=shell_local(
+        f"docker cp {shlex.quote(str(dump_path))} {shlex.quote(cid+':'+container_path)}",
+        timeout=120
+    )
+    if code != 0:
+        raise RuntimeError(err or out or "Could not copy SQLite backup into the container")
+    code,out,err=shell_local(f"docker start {shlex.quote(cid)}",timeout=COMPOSE_UP_TIMEOUT)
+    if code != 0:
+        raise RuntimeError(err or out or "Could not start PasarGuard after SQLite restore")
+
+
+def ensure_remote_prerequisites(client: paramiko.SSHClient) -> None:
+    code,_,_=ssh_shell(client,'test "$(id -u)" -eq 0',timeout=15)
+    if code != 0:
+        raise RuntimeError("Remote migration requires root SSH access.")
+    checks={
+        "docker":"command -v docker",
+        "docker compose":"docker compose version",
+        "python3":"command -v python3",
+        "tar":"command -v tar",
+        "sha256sum":"command -v sha256sum",
+    }
+    missing=[]
+    for label,command in checks.items():
+        code,_,_=ssh_shell(client,command,timeout=15)
+        if code != 0:
+            missing.append(label)
+    if not missing:
+        return
+    bootstrap=(
+        "export DEBIAN_FRONTEND=noninteractive; "
+        "command -v apt-get >/dev/null 2>&1 || { echo 'Ubuntu/Debian apt-get is required on the target.'; exit 1; }; "
+        "apt-get update -y >/dev/null && "
+        "apt-get install -y ca-certificates curl python3 tar coreutils >/dev/null; "
+        "if ! command -v docker >/dev/null 2>&1; then "
+        " if apt-cache show docker.io >/dev/null 2>&1; then apt-get install -y docker.io >/dev/null; "
+        " else curl -fsSL https://get.docker.com | sh; fi; "
+        "fi; "
+        "systemctl enable --now docker >/dev/null 2>&1 || true; "
+        "if ! docker compose version >/dev/null 2>&1; then "
+        " if apt-cache show docker-compose-v2 >/dev/null 2>&1; then apt-get install -y docker-compose-v2 >/dev/null; "
+        " elif apt-cache show docker-compose-plugin >/dev/null 2>&1; then apt-get install -y docker-compose-plugin >/dev/null; "
+        " else curl -fsSL https://get.docker.com | sh; fi; "
+        "fi; "
+        "docker compose version >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 && "
+        "command -v tar >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1"
+    )
+    info(f"Preparing remote prerequisites: {', '.join(missing)}")
+    code,out,err=ssh_shell(client,bootstrap,timeout=REMOTE_BOOTSTRAP_TIMEOUT)
+    if code != 0:
+        raise RuntimeError(err or out or "Failed to prepare remote Docker environment")
+
+
 def ensure_target_dirs_local() -> None:
     for p in (PASARGUARD_DIR, PG_NODE_DIR, PASARGUARD_DATA_DIR, PG_NODE_DATA_DIR):
         p.mkdir(parents=True, exist_ok=True)
@@ -1675,6 +1839,24 @@ def check_ssl_paths_local() -> None:
             warn(f"  {key} -> {value}")
     else:
         info("SSL path check passed (or panel SSL is not configured directly).")
+
+
+def wait_for_stack_local(compose_dir: Path, timeout: int = STACK_READY_TIMEOUT) -> bool:
+    deadline=time.time()+timeout
+    while time.time()<deadline:
+        if verify_stack_local(compose_dir):
+            return True
+        time.sleep(3)
+    return False
+
+
+def wait_for_stack_remote(client: paramiko.SSHClient, compose_dir: Path, timeout: int = STACK_READY_TIMEOUT) -> bool:
+    deadline=time.time()+timeout
+    while time.time()<deadline:
+        if verify_stack_remote(client,compose_dir):
+            return True
+        time.sleep(3)
+    return False
 
 
 def preflight_local(db_override: Optional[str] = None) -> bool:
