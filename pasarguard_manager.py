@@ -447,13 +447,22 @@ def capture_postgres_runtime(compose_dir: Path, service: str) -> dict[str, objec
         compose_dir,
         service,
         'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres '
-        "-Atc \"SELECT COALESCE((SELECT extversion FROM pg_extension WHERE extname='timescaledb'), '');\"",
+        "-Atc \"SELECT COALESCE((SELECT extversion || '|' || n.nspname "
+        "FROM pg_extension e JOIN pg_namespace n ON n.oid=e.extnamespace "
+        "WHERE e.extname='timescaledb'), '');\"",
     )
     if code != 0:
         raise RuntimeError(err or out or "Could not detect the source TimescaleDB version.")
-    version = out.strip().splitlines()[0].strip() if out.strip() else ""
-    if version:
-        runtime["timescaledb_version"] = version
+
+    value = out.strip().splitlines()[0].strip() if out.strip() else ""
+    if value:
+        parts = value.split("|", 1)
+        version = parts[0].strip()
+        schema = parts[1].strip() if len(parts) > 1 else "public"
+        if version:
+            runtime["timescaledb_version"] = version
+            runtime["timescaledb_schema"] = schema or "public"
+
     return runtime
 
 
@@ -992,6 +1001,7 @@ def ensure_remote_postgres_runtime(
     image = str(runtime.get("image") or "").strip()
     digests = [str(x).strip() for x in (runtime.get("repo_digests") or []) if str(x).strip()]
     expected_version = str(runtime.get("timescaledb_version") or "").strip()
+    expected_schema = str(runtime.get("timescaledb_schema") or "public").strip() or "public"
 
     # Prefer the exact source image digest. A mutable tag can point to a
     # different TimescaleDB build on the target and cause "$libdir/timescaledb-X"
@@ -1041,28 +1051,103 @@ def ensure_remote_postgres_runtime(
             compose_dir,
             service,
             "psql -v ON_ERROR_STOP=1 -U \"$POSTGRES_USER\" -d postgres "
-            "-Atc \"SELECT COALESCE(default_version, '') FROM pg_available_extensions "
-            "WHERE name='timescaledb';\"",
+            "-Atc \"SELECT COALESCE((SELECT string_agg(version, ',' ORDER BY version) "
+            "FROM pg_available_extension_versions WHERE name='timescaledb'), '');\"",
         )
         if code != 0:
             raise RuntimeError(err or out or "Could not inspect TimescaleDB availability")
 
-        available_version = out.strip().splitlines()[0].strip() if out.strip() else ""
-        if not available_version:
-            raise RuntimeError(
-                "The restored database image does not provide the TimescaleDB extension. "
-                "The source backup requires TimescaleDB."
-            )
-        if available_version != expected_version:
+        available_versions = out.strip().splitlines()[0].strip() if out.strip() else ""
+        versions = {x.strip() for x in available_versions.split(",") if x.strip()}
+        if expected_version not in versions:
             raise RuntimeError(
                 "TimescaleDB version mismatch before restore: "
-                f"source requires {expected_version}, target provides {available_version}. "
+                f"source requires {expected_version}, target image provides "
+                f"{available_versions or 'no TimescaleDB versions'}. "
                 "The database restore was stopped before importing SQL."
             )
 
-        info(f"Remote TimescaleDB extension available: {available_version}")
+        info(
+            f"Remote TimescaleDB extension version available: {expected_version} "
+            f"(schema: {expected_schema})"
+        )
     else:
         info("Source database does not use TimescaleDB; no TimescaleDB image check required.")
+
+
+def prepare_timescaledb_restore_remote(
+    client: paramiko.SSHClient,
+    compose_dir: Path,
+    service: str,
+    database: str,
+    runtime: Optional[dict[str, object]] = None,
+) -> None:
+    """
+    Prepare a freshly-created PostgreSQL database for a TimescaleDB dump.
+
+    A pg_dump from TimescaleDB can contain function definitions that reference
+    the versioned shared library (for example $libdir/timescaledb-2.30.1).
+    The extension must exist in the target database before the SQL dump is
+    replayed, otherwise PostgreSQL tries to resolve those functions against
+    the empty database and fails.
+    """
+    runtime = runtime or {}
+    expected_version = str(runtime.get("timescaledb_version") or "").strip()
+    if not expected_version:
+        return
+
+    schema = str(runtime.get("timescaledb_schema") or "public").strip() or "public"
+    schema_sql = pg_identifier(schema)
+    db_sql = shell_single_quote(database)
+
+    # The PostgreSQL superuser from the container environment creates the
+    # extension. Creating it at the exact source version also validates that
+    # the target image actually contains the required extension library.
+    inner = (
+        f"psql -v ON_ERROR_STOP=1 -U \"$POSTGRES_USER\" -d {db_sql} "
+        f"-c {shell_single_quote(f'CREATE SCHEMA IF NOT EXISTS {schema_sql}; CREATE EXTENSION IF NOT EXISTS timescaledb WITH SCHEMA {schema_sql} VERSION {pg_literal(expected_version)}; SELECT {schema_sql}.timescaledb_pre_restore();')}"
+    )
+    code, out, err = db_exec_remote(client, compose_dir, service, inner)
+    if code != 0:
+        raise RuntimeError(
+            err or out or
+            "Could not enable TimescaleDB at the exact source version before restore"
+        )
+
+    info(
+        f"TimescaleDB {expected_version} enabled in target database "
+        f"{database} and pre-restore mode is active."
+    )
+
+
+def finish_timescaledb_restore_remote(
+    client: paramiko.SSHClient,
+    compose_dir: Path,
+    service: str,
+    database: str,
+    runtime: Optional[dict[str, object]] = None,
+) -> None:
+    runtime = runtime or {}
+    expected_version = str(runtime.get("timescaledb_version") or "").strip()
+    if not expected_version:
+        return
+
+    schema = str(runtime.get("timescaledb_schema") or "public").strip() or "public"
+    schema_sql = pg_identifier(schema)
+    db_sql = shell_single_quote(database)
+
+    inner = (
+        f"psql -v ON_ERROR_STOP=1 -U \"$POSTGRES_USER\" -d {db_sql} "
+        f"-c {shell_single_quote(f'SELECT {schema_sql}.timescaledb_post_restore();')}"
+    )
+    code, out, err = db_exec_remote(client, compose_dir, service, inner)
+    if code != 0:
+        raise RuntimeError(
+            err or out or
+            "TimescaleDB post-restore failed after database import"
+        )
+
+    info(f"TimescaleDB {expected_version} post-restore completed.")
 
 
 def restore_database_remote(
@@ -1102,6 +1187,18 @@ def restore_database_remote(
         if code != 0:
             raise RuntimeError(err or out or "Could not recreate PostgreSQL database")
 
+        # A fresh PostgreSQL database has no TimescaleDB extension objects.
+        # Prepare the extension and enter TimescaleDB restore mode before
+        # replaying the dump so versioned $libdir/timescaledb-X.Y.Z symbols
+        # resolve correctly.
+        prepare_timescaledb_restore_remote(
+            client,
+            compose_dir,
+            service,
+            str(db),
+            runtime,
+        )
+
         command = (
             f"cd {shlex.quote(str(compose_dir))} && "
             f"cat {shlex.quote(remote_dump)} | docker compose exec -T {shlex.quote(service)} "
@@ -1126,6 +1223,15 @@ def restore_database_remote(
     code, out, err = ssh_shell(client, command, timeout=DATABASE_RESTORE_TIMEOUT)
     if code != 0:
         raise RuntimeError(err or out or "Remote database restore failed")
+
+    if family == "postgres":
+        finish_timescaledb_restore_remote(
+            client,
+            compose_dir,
+            service,
+            str(db),
+            runtime,
+        )
 
     if family == "mysql" and cfg.get("user") and cfg["user"] != "root" and cfg.get("password") is not None:
         user = str(cfg["user"])
