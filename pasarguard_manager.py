@@ -427,9 +427,9 @@ def capture_postgres_runtime(compose_dir: Path, service: str) -> dict[str, objec
     code, out, err = db_exec_local(
         compose_dir,
         service,
-        "psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres "
-        "-Atc "SELECT COALESCE((SELECT extversion FROM pg_extension WHERE extname='timescaledb'), "
-        "(SELECT default_version FROM pg_available_extensions WHERE name='timescaledb'), '');"",
+        'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres '
+        "-Atc \"SELECT COALESCE((SELECT extversion FROM pg_extension WHERE extname='timescaledb'), "
+        "(SELECT default_version FROM pg_available_extensions WHERE name='timescaledb'), '');\"",
     )
     if code != 0:
         raise RuntimeError(err or out or "Could not detect the source TimescaleDB version.")
