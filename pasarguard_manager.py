@@ -616,7 +616,7 @@ def wait_local_service(compose_dir: Path, service: str, family: str, timeout: in
     deadline = time.time() + timeout
     while time.time() < deadline:
         if family == "postgres":
-            cmd = f"docker compose exec -T {shlex.quote(service)} sh -c 'pg_isready -U "$POSTGRES_USER" -d postgres'"
+            cmd = f"docker compose exec -T {shlex.quote(service)} sh -c 'pg_isready -U \"$POSTGRES_USER\" -d postgres'"
         else:
             cmd = f"docker compose exec -T {shlex.quote(service)} sh -c 'mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent'"
         code, _, _ = shell_local(cmd, cwd=compose_dir)
