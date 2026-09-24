@@ -361,7 +361,7 @@ def parse_database_url(url: str) -> dict[str, Optional[str]]:
     password = urllib.parse.unquote(parsed.password) if parsed.password else None
     if family == "sqlite":
         raw_path = parsed.path or "db.sqlite3"
-        db_name = ("/" + urllib.parse.unquote(raw_path.lstrip("/"))) if raw_path.startswith("////") else urllib.parse.unquote(raw_path.lstrip("/"))
+        db_name = ("/" + urllib.parse.unquote(raw_path.lstrip("/"))) if raw_path.startswith("//") else urllib.parse.unquote(raw_path.lstrip("/"))
     else:
         db_name = urllib.parse.unquote(parsed.path.lstrip("/")) if parsed.path else None
     return {
@@ -2269,6 +2269,8 @@ def restore_remote(
             warn(f"Could not restore NATS volume {volume}: {err or out}")
 
     remote_check_ssl(client)
+    if not compose_up_remote(client, PASARGUARD_DIR):
+        raise RuntimeError("Remote Pasarguard stack failed to start")
     if not wait_for_stack_remote(client, PASARGUARD_DIR):
         raise RuntimeError("Remote Pasarguard stack verification failed")
     if await_remote_file(client, PG_NODE_DIR / "docker-compose.yml"):
