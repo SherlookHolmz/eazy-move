@@ -2246,7 +2246,11 @@ def interactive_menu() -> None:
         print("  5) 🤖 Telegram Backup Scheduler")
         print("  6) 🚪 Exit\n")
 
-        choice = input(f"{C.CYAN}Select [1-6]: {C.RESET}").strip()
+        try:
+            choice = input(f"{C.CYAN}Select [1-6]: {C.RESET}").strip()
+        except EOFError:
+            print("\nEOF received. Exiting.")
+            return
 
         try:
             if choice == "1":
@@ -2292,6 +2296,10 @@ def interactive_menu() -> None:
             else:
                 warn("Invalid option.")
                 time.sleep(1)
+        except EOFError:
+            print()
+            warn("Input stream closed. Exiting.")
+            return
         except KeyboardInterrupt:
             print()
             warn("Operation cancelled.")
