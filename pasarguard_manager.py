@@ -6,7 +6,7 @@ Migration/backup utility for PasarGuard Panel + PasarGuard Node.
 
 Author: Sherlook
 Project: PasarGuard Manager
-Version: 2.0.2
+Version: 2.0.3
 
 Goals:
 - Safe local backup/restore
@@ -51,7 +51,7 @@ except ImportError as exc:
 
 
 APP_NAME = "PasarGuard Manager"
-VERSION = "2.0.2"
+VERSION = "2.0.3"
 AUTHOR = "Sherlook"
 
 PASARGUARD_DIR = Path("/opt/pasarguard")
