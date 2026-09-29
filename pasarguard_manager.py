@@ -1312,7 +1312,7 @@ def ensure_container_reverse_proxy_topology_remote(client: paramiko.SSHClient, c
                 if "reverse_proxy" not in line:
                     return line
                 return re.sub(
-                    r"(?<=\\s)(?:pasarguard:\\d+|127\\.0\\.0\\.1:\\d+|localhost:\\d+|unix//[^\\s{}]+)",
+                    r"(?<=\s)(?:pasarguard:\d+|127\.0\.0\.1:\d+|localhost:\d+|unix//[^\s{}]+)",
                     expected_upstream,
                     line,
                     count=1,
@@ -1427,7 +1427,7 @@ def verify_container_reverse_proxy_remote(client: paramiko.SSHClient, compose_di
     if code != 0:
         raise RuntimeError(f"Could not read Caddyfile from container: {err or code}")
 
-    domain_match = re.search(r"(?m)^\\s*([A-Za-z0-9][A-Za-z0-9.-]*\\.[A-Za-z]{2,})(?::\\d+)?\\s*\\{", caddyfile)
+    domain_match = re.search(r"(?m)^\s*([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})(?::\d+)?\s*\{", caddyfile)
     if not domain_match:
         warn("Caddy validation passed, but no public domain was detected for an end-to-end dashboard check.")
         return
