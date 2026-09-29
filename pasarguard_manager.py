@@ -37,7 +37,7 @@ except ImportError as exc:
     raise SystemExit(2) from exc
 
 APP_NAME = "PasarGuard Manager"
-VERSION = "3.1.2"
+VERSION = "3.1.3"
 AUTHOR = "Sherlook"
 
 PASARGUARD_DIR = Path("/opt/pasarguard")
@@ -720,7 +720,7 @@ def validate_source_runtime(manifest: dict[str, Any]) -> dict[str, Any]:
         if not libraries:
             raise RuntimeError("Backup says TimescaleDB is installed but did not record a TimescaleDB library. Refusing restore.")
         if not any(
-            lib == "timescaledb.so" or re.fullmatch(r"timescaledb-\d+(?:\.\d+)*\.so", lib)
+            lib == "timescaledb.so" or re.fullmatch(r"timescaledb(?:-tsl)?-\d+(?:\.\d+)*\.so(?:\.\d+)*", lib)
             for lib in libraries
         ):
             raise RuntimeError(
