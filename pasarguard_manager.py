@@ -37,7 +37,7 @@ except ImportError as exc:
     raise SystemExit(2) from exc
 
 APP_NAME = "PasarGuard Manager"
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 AUTHOR = "Sherlook"
 
 PASARGUARD_DIR = Path("/opt/pasarguard")
@@ -720,10 +720,12 @@ def tar_volume(source: Path, destination: Path) -> None:
 
 
 def extra_cert_paths(compose_dir: Path, data_dir: Path, dumps: Iterable[Path]) -> list[str]:
+    """Find certificate/key paths without resolving away important symlinks."""
     found: set[str] = set()
     env = env_read(compose_dir / ".env")
     for key in ("UVICORN_SSL_CERTFILE", "UVICORN_SSL_KEYFILE"):
-        if env.get(key): found.add(env[key])
+        if env.get(key):
+            found.add(env[key].strip())
     for dump in dumps:
         try:
             if dump.stat().st_size <= 16 * 1024 * 1024:
@@ -737,17 +739,215 @@ def extra_cert_paths(compose_dir: Path, data_dir: Path, dumps: Iterable[Path]) -
                     found.update(m.group(1) for m in CERT_PATH_RE.finditer(path.read_text(errors="ignore")))
             except OSError:
                 pass
-    covered = [PASARGUARD_DIR.resolve(), PG_NODE_DIR.resolve(), PASARGUARD_DATA_DIR.resolve(), PG_NODE_DATA_DIR.resolve()]
-    result = []
+    covered = [
+        PASARGUARD_DIR.resolve(strict=False),
+        PG_NODE_DIR.resolve(strict=False),
+        PASARGUARD_DATA_DIR.resolve(strict=False),
+        PG_NODE_DATA_DIR.resolve(strict=False),
+    ]
+    result: list[str] = []
     for item in sorted(found):
         try:
-            p = Path(item).expanduser().resolve()
-            if not p.is_file(): continue
-            if any(p == base or base in p.parents for base in covered): continue
+            p = Path(item).expanduser()
+            if not p.is_absolute():
+                p = Path.cwd() / p
+            resolved = p.resolve(strict=False)
+            if not os.path.lexists(p):
+                continue
+            if any(resolved == base or base in resolved.parents for base in covered):
+                continue
             result.append(str(p))
         except OSError:
             continue
     return result
+
+
+def external_path_closure(paths: Iterable[str]) -> list[str]:
+    """Return external files plus their symlink targets."""
+    seen: set[str] = set()
+    queue = [Path(p) for p in paths]
+    result: list[str] = []
+    while queue:
+        cur = Path(os.path.abspath(str(queue.pop(0))))
+        key = str(cur)
+        if key in seen or not os.path.lexists(cur):
+            continue
+        seen.add(key)
+        result.append(key)
+        if cur.is_symlink():
+            try:
+                target = Path(os.readlink(cur))
+                if not target.is_absolute():
+                    target = cur.parent / target
+                target = Path(os.path.abspath(str(target)))
+                if os.path.lexists(target):
+                    queue.append(target)
+            except OSError:
+                pass
+    return sorted(result)
+
+
+def copy_external_path_to_archive(source: Path, work: Path) -> str:
+    """Copy an external file/symlink while preserving its original path layout."""
+    source = Path(os.path.abspath(str(source)))
+    relative = Path(str(source).lstrip("/"))
+    dest = work / "external_paths" / relative
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_symlink():
+        os.symlink(os.readlink(source), dest)
+    elif source.is_file():
+        shutil.copy2(source, dest, follow_symlinks=False)
+    else:
+        raise RuntimeError(f"External source is not a regular file/symlink: {source}")
+    return str(dest.relative_to(work))
+
+
+def runtime_metadata(compose_dir: Path) -> dict[str, Optional[str]]:
+    env = env_read(compose_dir / ".env")
+    return {
+        "vite_base_api": env.get("VITE_BASE_API"),
+        "dashboard_path": env.get("DASHBOARD_PATH"),
+        "uvicorn_port": env.get("UVICORN_PORT"),
+        "uvicorn_uds": env.get("UVICORN_UDS"),
+        "uvicorn_ssl_certfile": env.get("UVICORN_SSL_CERTFILE"),
+        "uvicorn_ssl_keyfile": env.get("UVICORN_SSL_KEYFILE"),
+    }
+
+
+def discover_reverse_proxy_sources_local(work_root: Path) -> list[dict[str, str]]:
+    """Capture host Nginx/Caddy config that fronts the PasarGuard service."""
+    work_root.mkdir(parents=True, exist_ok=True)
+    env = env_read(PASARGUARD_DIR / ".env")
+    port = str(env.get("UVICORN_PORT") or "8000")
+    tokens = ("pasarguard", f"127.0.0.1:{port}", f"localhost:{port}", f":{port}", "pasarguard.socket")
+    candidates: list[Path] = []
+    for base in (Path("/etc/nginx/sites-enabled"), Path("/etc/nginx/sites-available")):
+        if base.is_dir():
+            candidates.extend(sorted(base.glob("*")))
+    caddyfile = Path("/etc/caddy/Caddyfile")
+    if caddyfile.is_file():
+        candidates.append(caddyfile)
+
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for path in candidates:
+        try:
+            key = str(path.resolve(strict=False))
+            if key in seen or not os.path.lexists(path):
+                continue
+            seen.add(key)
+            target = path.resolve(strict=False) if path.is_symlink() else path
+            if not target.is_file():
+                continue
+            text = target.read_text(errors="ignore")[:1024 * 1024]
+            if not any(token in text for token in tokens):
+                continue
+            rel = Path(str(path).lstrip("/"))
+            dest = work_root / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if path.is_symlink():
+                os.symlink(os.readlink(path), dest)
+            else:
+                shutil.copy2(path, dest, follow_symlinks=False)
+            result.append({
+                "source": str(path),
+                "archive_path": str(dest.relative_to(work_root.parent)),
+                "label": "nginx" if str(path).startswith("/etc/nginx/") else "caddy",
+            })
+        except (OSError, UnicodeDecodeError) as exc:
+            warn(f"Could not inspect reverse proxy config {path}: {exc}")
+    return result
+
+
+def restore_external_local(staging: Path, item: dict[str, Any]) -> None:
+    src = staging / str(item["archive_path"])
+    dst = safe_restore_path(str(item["source"]))
+    if not src.is_symlink() and not src.is_file():
+        raise RuntimeError(f"Missing external restore file: {src}")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() or dst.is_symlink():
+        if dst.is_dir() and not dst.is_symlink():
+            shutil.rmtree(dst)
+        else:
+            dst.unlink()
+    if src.is_symlink():
+        os.symlink(os.readlink(src), dst)
+    else:
+        shutil.copy2(src, dst, follow_symlinks=False)
+
+
+def verify_tls_local(compose_dir: Path) -> None:
+    env = env_read(compose_dir / ".env")
+    cert = env.get("UVICORN_SSL_CERTFILE")
+    key = env.get("UVICORN_SSL_KEYFILE")
+    if not cert and not key:
+        return
+    if not cert or not key:
+        raise RuntimeError("Only one TLS path is configured in .env")
+    cert_path, key_path = Path(cert), Path(key)
+    if not cert_path.is_file():
+        raise RuntimeError(f"Configured TLS certificate is missing: {cert_path}")
+    if not key_path.is_file():
+        raise RuntimeError(f"Configured TLS private key is missing: {key_path}")
+    if command_exists("openssl"):
+        p = run_local(["openssl", "x509", "-in", str(cert_path), "-noout"], timeout=30)
+        if p.returncode != 0:
+            raise RuntimeError(p.stderr.decode(errors="replace").strip() or f"Invalid TLS certificate: {cert_path}")
+    info(f"TLS files verified: {cert_path} / {key_path}")
+
+
+def reload_reverse_proxies_local() -> None:
+    if Path("/etc/nginx/nginx.conf").is_file() and command_exists("nginx"):
+        p = run_local(["nginx", "-t"], timeout=30)
+        if p.returncode == 0:
+            run_local(["systemctl", "reload", "nginx"], timeout=30)
+            info("Nginx configuration validated and reloaded.")
+        else:
+            warn("Nginx configuration was restored, but nginx -t failed.")
+    if Path("/etc/caddy/Caddyfile").is_file() and command_exists("caddy"):
+        p = run_local(["caddy", "validate", "--config", "/etc/caddy/Caddyfile"], timeout=30)
+        if p.returncode == 0:
+            run_local(["systemctl", "reload", "caddy"], timeout=30)
+            info("Caddy configuration validated and reloaded.")
+        else:
+            warn("Caddy configuration was restored, but Caddy validation failed.")
+
+
+def verify_tls_remote(client: paramiko.SSHClient, compose_dir: Path) -> None:
+    command = (
+        f"cd {shell_quote(compose_dir)} && "
+        "python3 - <<'PY'\n"
+        "import os\n"
+        "env={}\n"
+        "if os.path.isfile('.env'):\n"
+        "  for line in open('.env', encoding='utf-8', errors='ignore'):\n"
+        "    line=line.strip()\n"
+        "    if not line or line.startswith('#') or '=' not in line: continue\n"
+        "    k,v=line.split('=',1); env[k.strip()]=v.strip().strip('\\"').strip("'")\n"
+        "cert=env.get('UVICORN_SSL_CERTFILE',''); key=env.get('UVICORN_SSL_KEYFILE','')\n"
+        "if cert or key:\n"
+        "  if not cert or not key: raise SystemExit('only one TLS path is configured')\n"
+        "  if not os.path.isfile(cert): raise SystemExit('missing certificate: '+cert)\n"
+        "  if not os.path.isfile(key): raise SystemExit('missing private key: '+key)\n"
+        "  print('TLS_OK '+cert+' '+key)\n"
+        "PY"
+    )
+    code, out, err = ssh_exec(client, command, timeout=60)
+    if code != 0:
+        raise RuntimeError(err or out or "Remote TLS validation failed")
+    if out.strip():
+        info(out.strip().splitlines()[-1])
+
+
+def reload_reverse_proxies_remote(client: paramiko.SSHClient) -> None:
+    code, _, _ = ssh_exec(client, "command -v nginx >/dev/null 2>&1 && nginx -t", timeout=30)
+    if code == 0:
+        ssh_exec(client, "systemctl reload nginx", timeout=30)
+        info("Remote Nginx configuration validated and reloaded.")
+    code, _, _ = ssh_exec(client, "command -v caddy >/dev/null 2>&1 && caddy validate --config /etc/caddy/Caddyfile", timeout=30)
+    if code == 0:
+        ssh_exec(client, "systemctl reload caddy", timeout=30)
+        info("Remote Caddy configuration validated and reloaded.")
 
 
 def backup_create(output_dir: Path, *, db_override: Optional[str] = None,
@@ -775,7 +975,7 @@ def backup_create(output_dir: Path, *, db_override: Optional[str] = None,
             "version": VERSION,
             "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "database": {"family": family, "user": cfg.get("user"), "database": cfg.get("database")},
-            "database_runtime": {}, "database_storage": [], "files": {}, "nats": [], "caddy": [], "extra_certs": [],
+            "database_runtime": {}, "database_storage": [], "files": {}, "nats": [], "caddy": [], "reverse_proxy": [], "extra_certs": [], "runtime": runtime_metadata(PASARGUARD_DIR),
         }
         shutil.copy2(PASARGUARD_DIR / "docker-compose.yml", work / "docker-compose.yml")
         if (PASARGUARD_DIR / ".env").exists():
@@ -822,11 +1022,10 @@ def backup_create(output_dir: Path, *, db_override: Optional[str] = None,
             if failed: raise RuntimeError(f"Failed to copy {src}: {failed[:3]}")
             if skipped: warn(f"Skipped {len(skipped)} special runtime files under {src}")
 
-        for i, source in enumerate(extra_cert_paths(PASARGUARD_DIR, PASARGUARD_DATA_DIR, dumps)):
-            dest = work / "extra_certs" / f"cert_{i:03d}" / Path(source).name
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, dest)
-            manifest["extra_certs"].append({"source": source, "archive_path": str(dest.relative_to(work))})
+        external_sources = external_path_closure(extra_cert_paths(PASARGUARD_DIR, PASARGUARD_DATA_DIR, dumps))
+        for source in external_sources:
+            archive_path = copy_external_path_to_archive(Path(source), work)
+            manifest["extra_certs"].append({"source": source, "archive_path": archive_path})
 
         if include_nats and env_read(PASARGUARD_DIR / ".env").get("NATS_ENABLED", "false").lower() in {"1", "true", "yes"}:
             for item in backup_nats_volumes_local(work / "nats"):
@@ -835,6 +1034,7 @@ def backup_create(output_dir: Path, *, db_override: Optional[str] = None,
         # Record Caddy bind sources/compose project paths conservatively. Volumes are intentionally handled separately.
         if include_caddy:
             manifest["caddy"] = discover_caddy_sources_local(work / "caddy")
+        manifest["reverse_proxy"] = discover_reverse_proxy_sources_local(work / "reverse_proxy")
 
         for path in dumps:
             rel = str(path.relative_to(work))
@@ -1370,6 +1570,11 @@ def restore_remote(client: paramiko.SSHClient, archive: Path, *, force: bool, di
         dst = safe_restore_path(item["source"])
         run_remote_checked(client, f"mkdir -p {shell_quote(dst.parent)} && cp -a {shell_quote(src)} {shell_quote(dst)}", f"Restoring certificate {dst}")
 
+    for item in manifest.get("reverse_proxy", []):
+        src = extract_dir / item["archive_path"]
+        dst = safe_restore_path(item["source"])
+        run_remote_checked(client, f"mkdir -p {shell_quote(dst.parent)} && cp -a {shell_quote(src)} {shell_quote(dst)}", f"Restoring reverse-proxy config {dst}")
+
     restore_caddy_remote(client, extract_dir, manifest)
     restore_nats_remote(client, extract_dir, manifest)
 
@@ -1408,6 +1613,9 @@ def restore_remote(client: paramiko.SSHClient, archive: Path, *, force: bool, di
 
     if await_remote_file(client, PG_NODE_DIR / "docker-compose.yml"):
         compose_up_remote(client, PG_NODE_DIR)
+
+    verify_tls_remote(client, PASARGUARD_DIR)
+    reload_reverse_proxies_remote(client)
 
     run_remote_checked(client, f"rm -rf {shell_quote(remote_root)}", "Cleaning remote temporary restore files")
     success("Remote restore completed and the PasarGuard stack is healthy")
@@ -1609,11 +1817,9 @@ def restore_local(archive: Path, *, force: bool = False, disable_nodes: bool = T
         for src_name, dst in (("pasarguard_data", PASARGUARD_DATA_DIR),("pg_node_opt",PG_NODE_DIR),("pg_node_data",PG_NODE_DATA_DIR)):
             src = staging / src_name
             if src.is_dir(): shutil.copytree(src, dst, dirs_exist_ok=True, symlinks=True)
-        # External certs.
+        # External certs/keys. Preserve Let's Encrypt symlinks.
         for item in manifest.get("extra_certs", []):
-            src = staging / item["archive_path"]
-            dst = safe_restore_path(item["source"])
-            dst.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(src, dst)
+            restore_external_local(staging, item)
         # Restore NATS volumes.
         for item in manifest.get("nats", []):
             volume = str(item["volume"]); archive_path = staging / item["archive_path"]
@@ -1621,6 +1827,20 @@ def restore_local(archive: Path, *, force: bool = False, disable_nodes: bool = T
             if code != 0 or not out: raise RuntimeError(f"Could not create NATS volume {volume}: {err or out}")
             p = run_local(["tar","-xzf",str(archive_path),"-C",out.strip()],timeout=600)
             if p.returncode != 0: raise RuntimeError(p.stderr.decode(errors="replace") or f"NATS volume restore failed: {volume}")
+        # Host reverse-proxy configurations.
+        for item in manifest.get("reverse_proxy", []):
+            src = staging / item["archive_path"]
+            dst = safe_restore_path(item["source"])
+            if not src.is_symlink() and not src.is_file():
+                raise RuntimeError(f"Missing reverse-proxy file: {src}")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.exists() or dst.is_symlink():
+                dst.unlink()
+            if src.is_symlink():
+                os.symlink(os.readlink(src), dst)
+            else:
+                shutil.copy2(src, dst, follow_symlinks=False)
+
         # Caddy bind/volume sources.
         for item in manifest.get("caddy", []):
             if item.get("kind") == "volume":
@@ -1650,6 +1870,8 @@ def restore_local(archive: Path, *, force: bool = False, disable_nodes: bool = T
                 set_nodes_disabled_local(PASARGUARD_DIR, db_service_local, cfg, family)
         compose_up_local(PASARGUARD_DIR)
         if (PG_NODE_DIR / "docker-compose.yml").is_file(): compose_up_local(PG_NODE_DIR)
+        verify_tls_local(PASARGUARD_DIR)
+        reload_reverse_proxies_local()
         success("Local restore completed")
     finally:
         shutil.rmtree(staging, ignore_errors=True)
