@@ -37,7 +37,7 @@ except ImportError as exc:
     raise SystemExit(2) from exc
 
 APP_NAME = "PasarGuard Manager"
-VERSION = "3.1.3"
+VERSION = "3.1.4"
 AUTHOR = "Sherlook"
 
 PASARGUARD_DIR = Path("/opt/pasarguard")
@@ -455,13 +455,28 @@ def db_exec_remote(client: paramiko.SSHClient, compose_dir: Path, service: str, 
 
 def wait_db_local(compose_dir: Path, service: str, family: str, timeout: int = SERVICE_READY_TIMEOUT) -> bool:
     deadline = time.time() + timeout
+    consecutive_ready = 0
     while time.time() < deadline:
         if family == "postgres":
             code, _, _ = db_exec_local(compose_dir, service, 'pg_isready -U "$POSTGRES_USER" -d postgres', timeout=15)
         else:
             code, _, _ = db_exec_local(compose_dir, service, 'mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent', timeout=15)
         if code == 0:
-            return True
+            p = run_local(["docker", "compose", "ps", "-q", service], cwd=compose_dir, timeout=20)
+            cid = p.stdout.decode(errors="replace").strip().splitlines()[0] if p.returncode == 0 and p.stdout.strip() else ""
+            if cid:
+                inspect = run_local(["docker", "inspect", "-f", "{{.State.Status}}/{{.State.Restarting}}", cid], timeout=20)
+                state = inspect.stdout.decode(errors="replace").strip()
+                if state == "running/false":
+                    consecutive_ready += 1
+                    if consecutive_ready >= 3:
+                        return True
+                else:
+                    consecutive_ready = 0
+            else:
+                consecutive_ready = 0
+        else:
+            consecutive_ready = 0
         time.sleep(2)
     return False
 
@@ -469,6 +484,7 @@ def wait_db_local(compose_dir: Path, service: str, family: str, timeout: int = S
 def wait_db_remote(client: paramiko.SSHClient, compose_dir: Path, service: str, family: str,
                    timeout: int = SERVICE_READY_TIMEOUT) -> bool:
     deadline = time.time() + timeout
+    consecutive_ready = 0
     while time.time() < deadline:
         if family == "postgres":
             inner = 'pg_isready -U "$POSTGRES_USER" -d postgres'
@@ -476,7 +492,22 @@ def wait_db_remote(client: paramiko.SSHClient, compose_dir: Path, service: str, 
             inner = 'mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent'
         code, _, _ = db_exec_remote(client, compose_dir, service, inner, timeout=20)
         if code == 0:
-            return True
+            state_cmd = (
+                f"cd {shell_quote(compose_dir)} && "
+                f"cid=$(docker compose ps -q {shell_quote(service)}) && "
+                f"test -n \"$cid\" && "
+                f"docker inspect -f '{{{{.State.Status}}}}/{{{{.State.Restarting}}}}' \"$cid\""
+            )
+            state_code, state_out, _ = ssh_exec(client, state_cmd, timeout=20)
+            state = state_out.strip().splitlines()[0] if state_code == 0 and state_out.strip() else ""
+            if state == "running/false":
+                consecutive_ready += 1
+                if consecutive_ready >= 3:
+                    return True
+            else:
+                consecutive_ready = 0
+        else:
+            consecutive_ready = 0
         time.sleep(2)
     return False
 
@@ -1381,9 +1412,24 @@ def restore_postgres_remote(client: paramiko.SSHClient, compose_dir: Path, servi
         f"cat {shell_quote(dump_path)} | docker compose exec -T {shell_quote(service)} "
         f"psql -v ON_ERROR_STOP=1 -U {shell_quote(user)} -d {shell_quote(db)}"
     )
-    code, out, err = ssh_exec(client, command, timeout=DATABASE_RESTORE_TIMEOUT)
-    if code != 0:
-        raise RuntimeError(f"PostgreSQL restore failed: {err or out or f'exit {code}'}")
+    last_detail = ""
+    for attempt in range(5):
+        code, out, err = ssh_exec(client, command, timeout=DATABASE_RESTORE_TIMEOUT)
+        if code == 0:
+            break
+        last_detail = err or out or f"exit {code}"
+        transient = any(
+            phrase in last_detail.lower()
+            for phrase in (
+                "the database system is starting up",
+                "the database system is shutting down",
+                "connection refused",
+                "no such file or directory",
+            )
+        )
+        if not transient or attempt == 4:
+            raise RuntimeError(f"PostgreSQL restore failed: {last_detail}")
+        time.sleep(4)
     finish_timescaledb_target(client, compose_dir, service, db, runtime)
 
     # Final extension version check: catch stale $libdir references before the stack starts.
