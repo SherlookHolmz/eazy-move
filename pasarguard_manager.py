@@ -37,7 +37,7 @@ except ImportError as exc:
     raise SystemExit(2) from exc
 
 APP_NAME = "PasarGuard Manager"
-VERSION = "3.1.6"
+VERSION = "3.1.7"
 AUTHOR = "Sherlook"
 
 PASARGUARD_DIR = Path("/opt/pasarguard")
@@ -1241,6 +1241,212 @@ def safe_restore_path(path_text: str) -> Path:
     return resolved
 
 
+
+def ensure_container_reverse_proxy_topology_remote(client: paramiko.SSHClient, compose_dir: Path) -> None:
+    """Align a containerized Caddy reverse proxy with PasarGuard's host-network deployment."""
+    code, cfg_text, err = ssh_exec(
+        client,
+        f"cd {shell_quote(compose_dir)} && docker compose config --format json",
+        timeout=60,
+    )
+    if code != 0:
+        raise RuntimeError(err or cfg_text or "Could not inspect remote Docker Compose configuration")
+    try:
+        config = json.loads(cfg_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Remote Docker Compose returned invalid JSON") from exc
+
+    services = config.get("services") or {}
+    panel_name = None
+    panel_spec = None
+    caddy_name = None
+    caddy_spec = None
+
+    for name, spec in services.items():
+        image = str(spec.get("image") or "").lower()
+        if panel_name is None and ("pasarguard/panel" in image or name.lower() == "pasarguard"):
+            panel_name, panel_spec = name, spec
+        if caddy_name is None and "caddy" in image:
+            caddy_name, caddy_spec = name, spec
+
+    if not panel_name or not caddy_name:
+        return
+
+    panel_host_network = str((panel_spec or {}).get("network_mode") or "").lower() == "host"
+    if not panel_host_network:
+        return
+
+    code, env_text, err = ssh_exec(client, f"cat {shell_quote(compose_dir / '.env')} 2>/dev/null || true")
+    if code != 0:
+        env_text = ""
+    env: dict[str, str] = {}
+    for raw in env_text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        env[key.strip()] = value
+
+    uds = env.get("UVICORN_UDS", "").strip()
+    port = env.get("UVICORN_PORT", "8000").strip() or "8000"
+    expected_upstream = f"unix//{uds}" if uds else f"127.0.0.1:{port}"
+
+    caddyfile_source = None
+    for mount in caddy_spec.get("volumes") or []:
+        target = str(mount.get("target") or "")
+        source = str(mount.get("source") or "")
+        if target == "/etc/caddy/Caddyfile" and source:
+            caddyfile_source = Path(source)
+            break
+
+    if caddyfile_source is not None and not caddyfile_source.is_absolute():
+        caddyfile_source = compose_dir / caddyfile_source
+
+    if caddyfile_source is not None:
+        code, caddy_text, err = ssh_exec(client, f"cat {shell_quote(caddyfile_source)} 2>/dev/null || true")
+        if code == 0 and caddy_text:
+            def rewrite_proxy_line(line: str) -> str:
+                if "reverse_proxy" not in line:
+                    return line
+                return re.sub(
+                    r"(?<=\\s)(?:pasarguard:\\d+|127\\.0\\.0\\.1:\\d+|localhost:\\d+|unix//[^\\s{}]+)",
+                    expected_upstream,
+                    line,
+                    count=1,
+                )
+
+            rewritten = "".join(rewrite_proxy_line(line) + "\n" for line in caddy_text.splitlines())
+            if rewritten != caddy_text:
+                command = f"printf '%s' {shell_quote(rewritten)} > {shell_quote(caddyfile_source)}"
+                code, out, err = ssh_exec(client, command, timeout=60)
+                if code != 0:
+                    raise RuntimeError(err or out or f"Could not normalize Caddy upstream in {caddyfile_source}")
+                info(f"Normalized Caddy upstream to {expected_upstream}")
+
+    # PasarGuard's official Compose uses host networking. A bridged Caddy container
+    # cannot reach a host-networked PasarGuard service by the Docker service name.
+    # Put Caddy in host mode too, and explicitly clear published ports/networks.
+    override = """services:
+  caddy:
+    network_mode: host
+    ports: !reset []
+    networks: !reset []
+    volumes:
+      - /var/lib/pasarguard:/var/lib/pasarguard
+"""
+    override_path = compose_dir / "docker-compose.override.yml"
+    command = f"printf '%s' {shell_quote(override)} > {shell_quote(override_path)}"
+    code, out, err = ssh_exec(client, command, timeout=60)
+    if code != 0:
+        raise RuntimeError(err or out or "Could not write Caddy network override")
+
+    code, out, err = ssh_exec(
+        client,
+        f"cd {shell_quote(compose_dir)} && docker compose config --quiet",
+        timeout=60,
+    )
+    if code != 0:
+        raise RuntimeError(err or out or "Caddy host-network override made Docker Compose invalid")
+    info("Containerized Caddy is aligned with PasarGuard host networking.")
+
+
+def verify_container_reverse_proxy_remote(client: paramiko.SSHClient, compose_dir: Path) -> None:
+    """Verify the real containerized Caddy path, not just container health."""
+    code, cfg_text, err = ssh_exec(
+        client,
+        f"cd {shell_quote(compose_dir)} && docker compose config --format json",
+        timeout=60,
+    )
+    if code != 0:
+        raise RuntimeError(err or cfg_text or "Could not inspect remote Compose configuration")
+    try:
+        config = json.loads(cfg_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Remote Docker Compose returned invalid JSON") from exc
+
+    services = config.get("services") or {}
+    caddy_service = next(
+        (name for name, spec in services.items() if "caddy" in str(spec.get("image") or "").lower()),
+        None,
+    )
+    if not caddy_service:
+        return
+
+    code, out, err = ssh_exec(
+        client,
+        f"cd {shell_quote(compose_dir)} && docker compose exec -T {shell_quote(caddy_service)} caddy validate --config /etc/caddy/Caddyfile",
+        timeout=60,
+    )
+    if code != 0:
+        raise RuntimeError(f"Caddy configuration validation failed: {err or out}")
+
+    code, env_text, err = ssh_exec(client, f"cat {shell_quote(compose_dir / '.env')} 2>/dev/null || true")
+    if code != 0:
+        env_text = ""
+    env: dict[str, str] = {}
+    for raw in env_text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        env[key.strip()] = value
+
+    dashboard = env.get("DASHBOARD_PATH", "/dashboard/").strip() or "/dashboard/"
+    if not dashboard.startswith("/"):
+        dashboard = "/" + dashboard
+
+    uds = env.get("UVICORN_UDS", "").strip()
+    port = env.get("UVICORN_PORT", "8000").strip() or "8000"
+    if uds:
+        direct_cmd = (
+            f"curl --silent --show-error --output /dev/null --max-time 15 "
+            f"--unix-socket {shell_quote(uds)} "
+            f"--write-out '%{{http_code}}' http://localhost{shell_quote(dashboard)}"
+        )
+    else:
+        direct_cmd = (
+            f"curl --silent --show-error --output /dev/null --max-time 15 "
+            f"--write-out '%{{http_code}}' http://127.0.0.1:{shell_quote(port)}{shell_quote(dashboard)}"
+        )
+    code, status, err = ssh_exec(client, direct_cmd, timeout=30)
+    status = status.strip()
+    if code != 0 or not re.fullmatch(r"[1-5]\d\d", status) or status in {"500", "502", "503", "504"}:
+        raise RuntimeError(f"PasarGuard direct HTTP check failed: HTTP {status or '000'} {err or ''}".strip())
+
+    code, caddyfile, err = ssh_exec(
+        client,
+        f"cd {shell_quote(compose_dir)} && docker compose exec -T {shell_quote(caddy_service)} sh -c 'cat /etc/caddy/Caddyfile'",
+        timeout=60,
+    )
+    if code != 0:
+        raise RuntimeError(f"Could not read Caddyfile from container: {err or code}")
+
+    domain_match = re.search(r"(?m)^\\s*([A-Za-z0-9][A-Za-z0-9.-]*\\.[A-Za-z]{2,})(?::\\d+)?\\s*\\{", caddyfile)
+    if not domain_match:
+        warn("Caddy validation passed, but no public domain was detected for an end-to-end dashboard check.")
+        return
+
+    domain = domain_match.group(1)
+    public_cmd = (
+        f"curl --silent --show-error --insecure --output /dev/null --max-time 20 "
+        f"--resolve {shell_quote(domain)}:443:127.0.0.1 "
+        f"--write-out '%{{http_code}}' https://{shell_quote(domain)}{shell_quote(dashboard)}"
+    )
+    code, status, err = ssh_exec(client, public_cmd, timeout=30)
+    status = status.strip()
+    if code != 0 or status in {"000", "404", "500", "502", "503", "504"}:
+        raise RuntimeError(
+            f"Caddy dashboard check failed for {domain}{dashboard}: HTTP {status or '000'} {err or ''}".strip()
+        )
+    success(f"Caddy dashboard path verified: https://{domain}{dashboard} -> HTTP {status}")
+
+
 def compose_down_remote(client: paramiko.SSHClient, dir_path: Path) -> None:
     code, out, err = ssh_exec(client, f"test -f {shell_quote(dir_path / 'docker-compose.yml')}")
     if code != 0: return
@@ -1675,6 +1881,7 @@ def restore_remote(client: paramiko.SSHClient, archive: Path, *, force: bool, di
         run_remote_checked(client, f"mkdir -p {shell_quote(dst.parent)} && cp -a {shell_quote(src)} {shell_quote(dst)}", f"Restoring reverse-proxy config {dst}")
 
     restore_caddy_remote(client, extract_dir, manifest)
+    ensure_container_reverse_proxy_topology_remote(client, PASARGUARD_DIR)
     restore_nats_remote(client, extract_dir, manifest)
 
     # Restore the DB now that all target paths are stable.
@@ -1714,6 +1921,7 @@ def restore_remote(client: paramiko.SSHClient, archive: Path, *, force: bool, di
         compose_up_remote(client, PG_NODE_DIR)
 
     verify_tls_remote(client, PASARGUARD_DIR)
+    verify_container_reverse_proxy_remote(client, PASARGUARD_DIR)
     reload_reverse_proxies_remote(client)
 
     run_remote_checked(client, f"rm -rf {shell_quote(remote_root)}", "Cleaning remote temporary restore files")
