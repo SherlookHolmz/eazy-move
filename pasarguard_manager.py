@@ -37,7 +37,7 @@ except ImportError as exc:
     raise SystemExit(2) from exc
 
 APP_NAME = "PasarGuard Manager"
-VERSION = "3.1.4"
+VERSION = "3.1.5"
 AUTHOR = "Sherlook"
 
 PASARGUARD_DIR = Path("/opt/pasarguard")
@@ -1402,9 +1402,20 @@ def restore_postgres_remote(client: paramiko.SSHClient, compose_dir: Path, servi
             sql += f" ALTER ROLE {pg_ident(user)} PASSWORD {pg_lit(str(cfg['password']))};"
         code, out, err = db_admin_sql_remote(client, compose_dir, service, sql)
         if code != 0: raise RuntimeError(err or out or "Could not prepare PostgreSQL role")
-    code, out, err = db_admin_sql_remote(client, compose_dir, service,
-                                         f"DROP DATABASE IF EXISTS {pg_ident(db)} WITH (FORCE); CREATE DATABASE {pg_ident(db)} OWNER {pg_ident(user)};")
-    if code != 0: raise RuntimeError(err or out or "Could not recreate PostgreSQL database")
+    # PostgreSQL does not allow DROP DATABASE / CREATE DATABASE inside one
+    # transaction. Execute the two database-level commands separately.
+    code, out, err = db_admin_sql_remote(
+        client, compose_dir, service,
+        f"DROP DATABASE IF EXISTS {pg_ident(db)} WITH (FORCE);"
+    )
+    if code != 0:
+        raise RuntimeError(err or out or "Could not drop PostgreSQL database")
+    code, out, err = db_admin_sql_remote(
+        client, compose_dir, service,
+        f"CREATE DATABASE {pg_ident(db)} OWNER {pg_ident(user)};"
+    )
+    if code != 0:
+        raise RuntimeError(err or out or "Could not recreate PostgreSQL database")
     prepare_timescaledb_target(client, compose_dir, service, db, runtime)
     # Feed SQL directly into psql from the remote host; no shell expansion of the dump itself.
     command = (
