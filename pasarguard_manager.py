@@ -387,7 +387,11 @@ def validate_image_runtime_local(image: str, runtime: dict[str, Any]) -> None:
     """Validate the immutable DB image without mounting the live target database."""
     checks = ["postgres --version", "pg_config --version"]
     if runtime.get("timescaledb_installed"):
-        checks.append("pkglib=$(pg_config --pkglibdir); test -f \"$pkglib/timescaledb-%s.so\"" % runtime["timescaledb_version"])
+        checks.append(
+            "pkglib=$(pg_config --pkglibdir); "
+            "(test -f \"$pkglib/timescaledb.so\" || "
+            "find \"$pkglib\" -maxdepth 1 -type f -name 'timescaledb-*.so' | grep -q .)"
+        )
     cmd = " && ".join(checks)
     p = run_local(["docker", "run", "--rm", "--entrypoint", "sh", image, "-c", cmd], timeout=180)
     if p.returncode != 0:
@@ -403,7 +407,11 @@ def validate_image_runtime_local(image: str, runtime: dict[str, Any]) -> None:
 def validate_image_runtime_remote(client: paramiko.SSHClient, image: str, runtime: dict[str, Any]) -> None:
     checks = ["postgres --version", "pg_config --version"]
     if runtime.get("timescaledb_installed"):
-        checks.append("pkglib=$(pg_config --pkglibdir); test -f \"$pkglib/timescaledb-%s.so\"" % runtime["timescaledb_version"])
+        checks.append(
+            "pkglib=$(pg_config --pkglibdir); "
+            "(test -f \"$pkglib/timescaledb.so\" || "
+            "find \"$pkglib\" -maxdepth 1 -type f -name 'timescaledb-*.so' | grep -q .)"
+        )
     command = f"docker run --rm --entrypoint sh {shell_quote(image)} -c {shell_single_quote(' && '.join(checks))}"
     code, out, err = ssh_exec(client, command, timeout=180)
     if code != 0:
@@ -515,7 +523,8 @@ def capture_postgres_runtime(compose_dir: Path, service: str, database: str) -> 
     library_rows: list[str] = []
     code, out, err = db_exec_local(
         compose_dir, service,
-        "pkglib=$(pg_config --pkglibdir) && find \"$pkglib\" -maxdepth 1 -type f -name 'timescaledb-*.so' -printf '%f\\n' | sort",
+        "pkglib=$(pg_config --pkglibdir) && find \"$pkglib\" -maxdepth 1 -type f "
+        "\\( -name 'timescaledb.so' -o -name 'timescaledb-*.so' \\) -printf '%f\\n' | sort",
     )
     if code == 0:
         library_rows = [line.strip() for line in out.splitlines() if line.strip()]
@@ -685,9 +694,14 @@ def validate_source_runtime(manifest: dict[str, Any]) -> dict[str, Any]:
         libraries = [str(x) for x in (runtime.get("timescaledb_libraries") or [])]
         if not libraries:
             raise RuntimeError("Backup says TimescaleDB is installed but did not record a TimescaleDB library. Refusing restore.")
-        expected_library = f"timescaledb-{version}.so"
-        if expected_library not in libraries:
-            raise RuntimeError(f"Backup TimescaleDB metadata is inconsistent: {expected_library} is missing from recorded libraries.")
+        if not any(
+            lib == "timescaledb.so" or re.fullmatch(r"timescaledb-\\d+(?:\\.\\d+)*\\.so", lib)
+            for lib in libraries
+        ):
+            raise RuntimeError(
+                "Backup TimescaleDB metadata is inconsistent: "
+                "no usable TimescaleDB shared library was recorded."
+            )
     if family == "postgres" and not runtime.get("postgres_version_num"):
         raise RuntimeError("Backup does not contain PostgreSQL server-version metadata. Create a new backup before restoring.")
     return runtime
