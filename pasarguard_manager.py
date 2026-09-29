@@ -37,7 +37,7 @@ except ImportError as exc:
     raise SystemExit(2) from exc
 
 APP_NAME = "PasarGuard Manager"
-VERSION = "3.1.5"
+VERSION = "3.1.6"
 AUTHOR = "Sherlook"
 
 PASARGUARD_DIR = Path("/opt/pasarguard")
