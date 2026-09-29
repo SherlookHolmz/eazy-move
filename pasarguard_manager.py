@@ -695,7 +695,7 @@ def validate_source_runtime(manifest: dict[str, Any]) -> dict[str, Any]:
         if not libraries:
             raise RuntimeError("Backup says TimescaleDB is installed but did not record a TimescaleDB library. Refusing restore.")
         if not any(
-            lib == "timescaledb.so" or re.fullmatch(r"timescaledb-\\d+(?:\\.\\d+)*\\.so", lib)
+            lib == "timescaledb.so" or re.fullmatch(r"timescaledb-\d+(?:\.\d+)*\.so", lib)
             for lib in libraries
         ):
             raise RuntimeError(
