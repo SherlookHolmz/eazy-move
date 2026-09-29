@@ -389,8 +389,10 @@ def validate_image_runtime_local(image: str, runtime: dict[str, Any]) -> None:
     if runtime.get("timescaledb_installed"):
         checks.append(
             "pkglib=$(pg_config --pkglibdir); "
-            "(test -f \"$pkglib/timescaledb.so\" || "
-            "find \"$pkglib\" -maxdepth 1 -type f -name 'timescaledb-*.so' | grep -q .)"
+            "(test -e \"$pkglib/timescaledb.so\" || "
+            "ls \"$pkglib\"/timescaledb*.so* >/dev/null 2>&1 || "
+            "(sharedir=$(pg_config --sharedir) && "
+            "test -e \"$sharedir/extension/timescaledb.control\"))"
         )
     cmd = " && ".join(checks)
     p = run_local(["docker", "run", "--rm", "--entrypoint", "sh", image, "-c", cmd], timeout=180)
@@ -409,8 +411,10 @@ def validate_image_runtime_remote(client: paramiko.SSHClient, image: str, runtim
     if runtime.get("timescaledb_installed"):
         checks.append(
             "pkglib=$(pg_config --pkglibdir); "
-            "(test -f \"$pkglib/timescaledb.so\" || "
-            "find \"$pkglib\" -maxdepth 1 -type f -name 'timescaledb-*.so' | grep -q .)"
+            "(test -e \"$pkglib/timescaledb.so\" || "
+            "ls \"$pkglib\"/timescaledb*.so* >/dev/null 2>&1 || "
+            "(sharedir=$(pg_config --sharedir) && "
+            "test -e \"$sharedir/extension/timescaledb.control\"))"
         )
     command = f"docker run --rm --entrypoint sh {shell_quote(image)} -c {shell_single_quote(' && '.join(checks))}"
     code, out, err = ssh_exec(client, command, timeout=180)
@@ -521,13 +525,30 @@ def capture_postgres_runtime(compose_dir: Path, service: str, database: str) -> 
         raise RuntimeError(f"Unexpected TimescaleDB extension version: {ts_version}")
 
     library_rows: list[str] = []
-    code, out, err = db_exec_local(
-        compose_dir, service,
-        "pkglib=$(pg_config --pkglibdir) && find \"$pkglib\" -maxdepth 1 -type f "
-        "\\( -name 'timescaledb.so' -o -name 'timescaledb-*.so' \\) -printf '%f\\n' | sort",
+    library_check = (
+        "pkglib=$(pg_config --pkglibdir) || exit 21; "
+        "sharedir=$(pg_config --sharedir) || exit 22; "
+        "echo \"PKGLIBDIR=$pkglib\"; "
+        "echo \"SHAREDIR=$sharedir\"; "
+        "for f in \"$pkglib\"/timescaledb*.so*; do "
+        "  if [ -e \"$f\" ] || [ -L \"$f\" ]; then basename \"$f\"; fi; "
+        "done; "
+        "for f in \"$sharedir\"/extension/timescaledb.control \"$sharedir\"/extension/timescaledb--*.sql; do "
+        "  if [ -e \"$f\" ] || [ -L \"$f\" ]; then basename \"$f\"; fi; "
+        "done"
     )
+    code, out, err = db_exec_local(compose_dir, service, library_check)
     if code == 0:
-        library_rows = [line.strip() for line in out.splitlines() if line.strip()]
+        library_rows = [
+            line.strip()
+            for line in out.splitlines()
+            if line.strip() and not line.startswith(("PKGLIBDIR=", "SHAREDIR="))
+        ]
+    else:
+        warn(
+            "Could not inspect TimescaleDB files inside the source database container: "
+            f"{err or out or f'exit {code}'}"
+        )
 
     runtime: dict[str, Any] = {
         "service": service,
@@ -542,7 +563,11 @@ def capture_postgres_runtime(compose_dir: Path, service: str, database: str) -> 
         "timescaledb_libraries": library_rows,
     }
     if runtime["timescaledb_installed"] and not library_rows:
-        raise RuntimeError("TimescaleDB is registered in the application database but no timescaledb shared library was found in the source image")
+        raise RuntimeError(
+            "TimescaleDB is registered in the application database, but the source "
+            "container did not expose its TimescaleDB extension files. "
+            "The source-container inspection command failed or the image layout is unsupported."
+        )
     return runtime
 
 
